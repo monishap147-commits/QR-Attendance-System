@@ -1,0 +1,993 @@
+import { createFileRoute } from "@tanstack/react-router";
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  Camera, CameraOff, ScanFace, Users, Clock, Percent, Activity, CheckCircle2, AlertTriangle, Play, Square, QrCode
+} from "lucide-react";
+import { toast } from "sonner";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { Label } from "@/components/ui/label";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Progress } from "@/components/ui/progress";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { TagSelect } from "@/components/TagSelect";
+import {
+  useTaxonomy, useStudents, useAttendance,
+  addDepartment, addSubject, addAttendance,
+} from "@/lib/store";
+import { supabase } from "@/integrations/supabase/client";
+import * as faceapi from "face-api.js";
+
+// Strict Euclidean distance threshold for Face Recognition.
+const MATCH_THRESHOLD = 0.55;
+
+export const Route = createFileRoute("/_app/attendance")({
+  head: () => ({ meta: [{ title: "Attendance —QRAttend" }] }),
+  component: AttendancePage,
+});
+
+type RecogState =
+  | { kind: "idle" }
+  | { kind: "detecting" }
+  | { kind: "recognized"; name: string; id: string; confidence: number }
+  | { kind: "unknown"; confidence: number };
+
+function AttendancePage() {
+  const tax = useTaxonomy();
+  const students = useStudents();
+  const attendance = useAttendance();
+
+  const [department, setDepartment] = useState("");
+  const [year, setYear] = useState("");
+  const [subject, setSubject] = useState("");
+
+  // Mode Selection: "face" (default) or "qr" (new)
+  const [attendanceMode, setAttendanceMode] = useState<"face" | "qr">("face");
+
+  // --- Face Recognition State ---
+  const [cameraOn, setCameraOn] = useState(false);
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [startedAt, setStartedAt] = useState<number | null>(null);
+  const [elapsed, setElapsed] = useState(0);
+  const [recog, setRecog] = useState<RecogState>({ kind: "idle" });
+  const [modelsLoaded, setModelsLoaded] = useState(false);
+  const [faceDetected, setFaceDetected] = useState(false);
+
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const isSavingRef = useRef(false);
+  const timerRef = useRef<any>(null);
+
+  // --- QR Attendance State ---
+  const [qrScannerActive, setQrScannerActive] = useState(false);
+  const [qrLoading, setQrLoading] = useState(false);
+  const [scannedStudent, setScannedStudent] = useState<any | null>(null);
+  const [scanStatus, setScanStatus] = useState<{ type: "success" | "error" | "idle"; message: string }>({
+    type: "idle",
+    message: "",
+  });
+  const html5QrCodeRef = useRef<any>(null);
+  const lastScannedCodeRef = useRef<{ code: string; time: number } | null>(null);
+
+  const subjectOptions = useMemo(
+    () =>
+      tax.subjects
+        .filter(
+          (s) =>
+            (!department || s.department === department) &&
+            (!year || s.year === year),
+        )
+        .map((s) => s.name),
+    [tax.subjects, department, year],
+  );
+
+  const sessionRecords = attendance.filter((a) => sessionId && a.sessionId === sessionId);
+
+  const eligibleStudents = useMemo(
+    () =>
+      students.filter(
+        (s) =>
+          (!department || s.department === department) &&
+          (!year || s.year === year),
+      ),
+    [students, department, year],
+  );
+
+  // Parse and validate Reference Face Embedding
+  const getValidEmbedding = (student: any): Float32Array | null => {
+    if (!student || !student.faceEmbedding) {
+      return null;
+    }
+    try {
+      let embedding = student.faceEmbedding;
+      if (typeof embedding === "string") {
+        embedding = JSON.parse(embedding);
+      }
+      if (!Array.isArray(embedding) && !(embedding instanceof Float32Array)) {
+        return null;
+      }
+      if (embedding.length !== 128) {
+        return null;
+      }
+      const floatArray = new Float32Array(embedding);
+      for (let i = 0; i < floatArray.length; i++) {
+        if (isNaN(floatArray[i])) {
+          return null;
+        }
+      }
+      return floatArray;
+    } catch (e) {
+      return null;
+    }
+  };
+
+  const validRegisteredEmbeddingsCount = useMemo(() => {
+    let count = 0;
+    eligibleStudents.forEach((student) => {
+      if (getValidEmbedding(student) !== null) {
+        count++;
+      }
+    });
+    return count;
+  }, [eligibleStudents]);
+
+  // Load face-api models
+  useEffect(() => {
+    let active = true;
+    const loadModels = async () => {
+      try {
+        const modelUrl = "/models";
+        await Promise.all([
+          faceapi.nets.tinyFaceDetector.loadFromUri(modelUrl),
+          faceapi.nets.faceLandmark68Net.loadFromUri(modelUrl),
+          faceapi.nets.faceRecognitionNet.loadFromUri(modelUrl),
+        ]);
+        if (active) {
+          setModelsLoaded(true);
+        }
+      } catch (err) {
+        console.error("[face-api] Error loading models:", err);
+        toast.error("Failed to load face recognition models");
+      }
+    };
+    loadModels();
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  // Session elapsed timer
+  useEffect(() => {
+    if (!sessionId || !startedAt) return;
+    const t = setInterval(() => setElapsed(Math.floor((Date.now() - startedAt) / 1000)), 1000);
+    return () => clearInterval(t);
+  }, [sessionId, startedAt]);
+
+  // Clean up all cameras on unmount
+  useEffect(() => {
+    return () => {
+      stopCameraInternal();
+      stopQrScannerInternal();
+    };
+  }, []);
+
+  const stateRef = useRef({
+    cameraOn,
+    sessionId,
+    modelsLoaded,
+    eligibleStudents,
+    attendance,
+    subject,
+    department,
+    year,
+    validRegisteredEmbeddingsCount,
+  });
+
+  useEffect(() => {
+    stateRef.current = {
+      cameraOn,
+      sessionId,
+      modelsLoaded,
+      eligibleStudents,
+      attendance,
+      subject,
+      department,
+      year,
+      validRegisteredEmbeddingsCount,
+    };
+  }, [cameraOn, sessionId, modelsLoaded, eligibleStudents, attendance, subject, department, year, validRegisteredEmbeddingsCount]);
+
+  // Continuous Face Recognition Loop
+  useEffect(() => {
+    let active = true;
+
+    const runRecognition = async () => {
+      if (!active) return;
+      const currentState = stateRef.current;
+
+      if (!currentState.cameraOn || !currentState.sessionId || !currentState.modelsLoaded || !videoRef.current || attendanceMode !== "face") {
+        setFaceDetected(false);
+        timerRef.current = setTimeout(runRecognition, 800);
+        return;
+      }
+
+      if (isSavingRef.current) {
+        timerRef.current = setTimeout(runRecognition, 500);
+        return;
+      }
+
+      if (currentState.validRegisteredEmbeddingsCount === 0) {
+        setFaceDetected(false);
+        setRecog({ kind: "idle" });
+        timerRef.current = setTimeout(runRecognition, 1200);
+        return;
+      }
+
+      const video = videoRef.current;
+
+      if (video.readyState >= 2 && video.videoWidth > 0) {
+        try {
+          setRecog((prev) => (prev.kind === "idle" ? { kind: "detecting" } : prev));
+          const detection = await faceapi
+            .detectSingleFace(video, new faceapi.TinyFaceDetectorOptions())
+            .withFaceLandmarks()
+            .withFaceDescriptor();
+
+          if (!active) return;
+
+          if (detection) {
+            setFaceDetected(true);
+            const liveDescriptor = detection.descriptor;
+
+            let bestMatchStudent: any = null;
+            let bestDistance = Infinity;
+
+            currentState.eligibleStudents.forEach((student) => {
+              const refArray = getValidEmbedding(student);
+              if (!refArray) return;
+              const distance = faceapi.euclideanDistance(liveDescriptor, refArray);
+              if (distance < bestDistance) {
+                bestDistance = distance;
+                bestMatchStudent = student;
+              }
+            });
+
+            const isMatch = bestMatchStudent !== null && bestDistance <= MATCH_THRESHOLD;
+
+            if (isMatch) {
+              const confidenceVal = Math.max(0, Math.min(100, Math.round((1 - (bestDistance / 0.60)) * 100)));
+              const todayStr = new Date().toISOString().slice(0, 10);
+
+              const alreadyMarked = currentState.attendance.some((r) => {
+                const sId = r.studentId || r.student_id;
+                const subj = r.subject || r.subject_id;
+                return sId === bestMatchStudent.id && subj === currentState.subject && r.date === todayStr;
+              });
+
+              if (alreadyMarked) {
+                setRecog({
+                  kind: "recognized",
+                  name: bestMatchStudent.name,
+                  id: bestMatchStudent.id,
+                  confidence: confidenceVal,
+                });
+              } else {
+                await markPresent(bestMatchStudent.id, bestMatchStudent.name, confidenceVal);
+              }
+            } else {
+              setRecog({ kind: "unknown", confidence: 0 });
+            }
+          } else {
+            setFaceDetected(false);
+            setRecog({ kind: "detecting" });
+          }
+        } catch (err) {
+          console.error("[Recognition Loop] Error:", err);
+        }
+      } else {
+        setFaceDetected(false);
+      }
+
+      timerRef.current = setTimeout(runRecognition, 500);
+    };
+
+    if (cameraOn && sessionId && modelsLoaded && attendanceMode === "face") {
+      timerRef.current = setTimeout(runRecognition, 800);
+    }
+
+    return () => {
+      active = false;
+      if (timerRef.current) clearTimeout(timerRef.current);
+    };
+  }, [cameraOn, sessionId, modelsLoaded, attendanceMode]);
+
+  const startCamera = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 }, audio: false });
+      streamRef.current = stream;
+
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        await new Promise<void>((resolve) => {
+          if (!videoRef.current) return resolve();
+          videoRef.current.onloadedmetadata = () => resolve();
+        });
+        await videoRef.current.play();
+      }
+      setCameraOn(true);
+      setRecog({ kind: "detecting" });
+    } catch (err) {
+      console.error("[Camera] Failed to initialize:", err);
+      toast.error("Unable to access camera");
+    }
+  };
+
+  const stopCameraInternal = () => {
+    streamRef.current?.getTracks().forEach((t) => t.stop());
+    streamRef.current = null;
+  };
+
+  const stopCamera = () => {
+    stopCameraInternal();
+    setCameraOn(false);
+    setFaceDetected(false);
+    setRecog({ kind: "idle" });
+  };
+
+  const startSession = async () => {
+    if (!department || !subject) {
+      toast.error("Department and Subject are required");
+      return;
+    }
+    const sid = `S-${Date.now()}`;
+    setSessionId(sid);
+    setStartedAt(Date.now());
+    setElapsed(0);
+    toast.success("Session started");
+
+    if (attendanceMode === "face" && !cameraOn) {
+      await startCamera();
+    }
+  };
+
+  const stopSession = () => {
+    setSessionId(null);
+    setStartedAt(null);
+    setFaceDetected(false);
+    setRecog({ kind: "idle" });
+    stopQrScannerInternal();
+    setQrScannerActive(false);
+    toast("Session stopped");
+  };
+
+  // Mark student present for Face Mode
+  const markPresent = async (studentId: string, studentName: string, confidence: number) => {
+    if (isSavingRef.current) return;
+    const latestState = stateRef.current;
+    if (!latestState.sessionId || !latestState.subject || !latestState.department) return;
+
+    isSavingRef.current = true;
+    const now = new Date();
+    const payload = {
+      id: crypto.randomUUID(),
+      sessionId: latestState.sessionId,
+      session_id: latestState.sessionId,
+      studentId: studentId,
+      student_id: studentId,
+      studentName: studentName,
+      student_name: studentName,
+      department: latestState.department,
+      subject: latestState.subject,
+      subject_id: latestState.subject,
+      year: latestState.year,
+      date: now.toISOString().slice(0, 10),
+      time: now.toTimeString().slice(0, 8),
+      status: "Present",
+    };
+
+    try {
+      // 1. Insert into existing Supabase database
+      const { error } = await supabase.from("attendance_records").insert({
+        student_id: studentId,
+        subject_id: latestState.subject,
+        date: payload.date,
+        time: payload.time,
+        status: "Present"
+      });
+
+      if (error) throw error;
+
+      // 2. Synchronize memory state manager
+      const saveResult = addDepartment ? addAttendance(payload) : null;
+      if (saveResult instanceof Promise) {
+        await saveResult;
+      }
+
+      setRecog({ kind: "recognized", name: studentName, id: studentId, confidence });
+      toast.success(`Attendance marked: ${studentName}`);
+    } catch (err) {
+      console.error("[markPresent] Database save failed:", err);
+      toast.error("Database save failed. Marking locally only.");
+    } finally {
+      isSavingRef.current = false;
+    }
+  };
+
+  // --- QR Scanner Functionality ---
+  const startQrScanner = async () => {
+    if (!sessionId) {
+      toast.error("Please start an attendance session first.");
+      return;
+    }
+    setQrLoading(true);
+    try {
+      // Lazy load html5-qrcode dynamically to support browser loading
+      const { Html5Qrcode } = await import("html5-qrcode");
+      const elementId = "qr-scanner-mount";
+
+      if (!document.getElementById(elementId)) {
+        throw new Error("Scanner viewport element not found in DOM");
+      }
+
+      const html5QrCode = new Html5Qrcode(elementId);
+      html5QrCodeRef.current = html5QrCode;
+
+      await html5QrCode.start(
+        { facingMode: "environment" },
+        {
+          fps: 10,
+          qrbox: (width, height) => {
+            const minSize = Math.min(width, height);
+            const boxSize = Math.floor(minSize * 0.7);
+            return { width: boxSize, height: boxSize };
+          },
+        },
+        (decodedText) => {
+          handleQrCodeScanned(decodedText);
+        },
+        () => {
+          // Silent callback during scan intervals
+        }
+      );
+
+      setQrScannerActive(true);
+      toast.success("QR scanner started");
+    } catch (err: any) {
+      console.error("[QR Scanner Error]:", err);
+      toast.error(err?.message || "Failed to start camera for QR scanning.");
+    } finally {
+      setQrLoading(false);
+    }
+  };
+
+  const stopQrScannerInternal = async () => {
+    if (html5QrCodeRef.current) {
+      try {
+        await html5QrCodeRef.current.stop();
+      } catch (err) {
+        console.warn("[QR Scanner stop warning]:", err);
+      }
+      html5QrCodeRef.current = null;
+    }
+  };
+
+  const stopQrScanner = async () => {
+    await stopQrScannerInternal();
+    setQrScannerActive(false);
+    toast("QR Scanner stopped");
+  };
+
+  const handleQrCodeScanned = async (decodedText: string) => {
+    const cleanCode = decodedText.trim();
+    if (!cleanCode) return;
+
+    // Standard scanning scan cooldown mechanism
+    const currentTime = Date.now();
+    if (lastScannedCodeRef.current && lastScannedCodeRef.current.code === cleanCode) {
+      if (currentTime - lastScannedCodeRef.current.time < 3500) {
+        return; // Still in scan cooldown interval
+      }
+    }
+    lastScannedCodeRef.current = { code: cleanCode, time: currentTime };
+
+    const targetSubject = subject;
+    const todayStr = new Date().toISOString().slice(0, 10);
+
+    try {
+      // 1. Resolve student profile from existing lists using roll_no
+      const foundStudent = students.find(
+        (s) => s.roll_no?.toLowerCase() === cleanCode.toLowerCase() || s.id === cleanCode
+      );
+
+      if (!foundStudent) {
+        setScanStatus({ type: "error", message: "Invalid QR Code or Student Not Found." });
+        return;
+      }
+
+      // 2. Enforce that the student belongs to the session's Department and Year
+      const studentDept = (foundStudent.department || "").trim().toLowerCase();
+      const studentYear = String(foundStudent.year || "").trim().toLowerCase();
+      const sessionDept = (department || "").trim().toLowerCase();
+      const sessionYear = String(year || "").trim().toLowerCase();
+
+      if (studentDept !== sessionDept || studentYear !== sessionYear) {
+        setScanStatus({
+          type: "error",
+          message: "Student does not belong to this Department and Year.",
+        });
+        return;
+      }
+
+      setScannedStudent(foundStudent);
+
+      // 2. Query check for existing record to prevent duplicate attendance
+      const { data: existingRecord } = await supabase
+        .from("attendance_records")
+        .select("id")
+        .eq("student_id", foundStudent.id)
+        .eq("subject_id", targetSubject)
+        .eq("date", todayStr)
+        .maybeSingle();
+
+      if (existingRecord) {
+        setScanStatus({ type: "error", message: "Attendance already marked for today." });
+        return;
+      }
+
+      // 3. Mark student as present in the database table
+      // 3. Mark student as present in the database table
+      const nowTime = new Date().toTimeString().slice(0, 8);
+
+      const { error: insertError } = await supabase.from('attendance_records').insert([
+        {
+          session_id: sessionId,
+          student_id: foundStudent.id,
+          student_name: foundStudent.name,
+          department: foundStudent.department || department,
+          year: foundStudent.year || year,
+          subject: targetSubject,
+          time: nowTime,
+          date: todayStr,
+          status: 'Present'
+        }
+      ]);
+
+      if (insertError) throw insertError;
+
+      // 4. Update memory state synchronized with dashboard metrics
+      addAttendance({
+        id: crypto.randomUUID(),
+        sessionId: sessionId || "S-QR",
+        session_id: sessionId || "S-QR",
+        studentId: foundStudent.id,
+        student_id: foundStudent.id,
+        studentName: foundStudent.name,
+        student_name: foundStudent.name,
+        department: foundStudent.department || department,
+        subject: targetSubject,
+        subject_id: targetSubject,
+        year: foundStudent.year || year,
+        date: todayStr,
+        time: new Date().toTimeString().slice(0, 8),
+        status: "Present",
+      });
+
+      setScanStatus({
+        type: "success",
+        message: `Attendance marked successfully for ${foundStudent.name}.`,
+      });
+      toast.success(`Success: ${foundStudent.name} registered`);
+    } catch (err: any) {
+      console.error("[QR Scanner DB Error]", err);
+      setScanStatus({ type: "error", message: "Database transaction failed." });
+    }
+  };
+
+  const rate = eligibleStudents.length
+    ? Math.round((sessionRecords.length / eligibleStudents.length) * 100)
+    : 0;
+
+  const fmtElapsed = `${String(Math.floor(elapsed / 3600)).padStart(2, "0")}:${String(
+    Math.floor((elapsed % 3600) / 60),
+  ).padStart(2, "0")}:${String(elapsed % 60).padStart(2, "0")}`;
+
+  const sessionActive = !!sessionId;
+  const recognized = recog.kind === "recognized";
+  const unknown = recog.kind === "unknown";
+  const confidence = recognized || unknown ? recog.confidence : 0;
+
+  return (
+    <div className="max-w-7xl mx-auto space-y-6">
+      <div className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-4">
+        <div>
+          <h2 className="text-2xl font-bold tracking-tight"> Roster Attendance Console</h2>
+          <p className="text-sm text-muted-foreground">Register students using standard Face ID metrics or secure QR Scan Roster.</p>
+        </div>
+        <div className="flex items-center gap-2">
+          <Badge variant={sessionActive ? "default" : "secondary"} className="gap-1.5">
+            <span className={`h-1.5 w-1.5 rounded-full ${sessionActive ? "bg-success animate-pulse" : "bg-muted-foreground"}`} />
+            {sessionActive ? "Session Active" : "Idle"}
+          </Badge>
+        </div>
+      </div>
+
+      {/* Mode Switch Selection tabs */}
+      <div className="flex space-x-1 bg-muted/40 p-1 rounded-lg max-w-sm">
+        <button
+          onClick={() => {
+            setAttendanceMode("face");
+            stopQrScannerInternal();
+            setQrScannerActive(false);
+          }}
+          className={`flex items-center gap-2 px-3.5 py-1.5 text-xs font-semibold rounded-md transition-all ${
+            attendanceMode === "face"
+              ? "bg-background text-foreground shadow-sm"
+              : "text-muted-foreground hover:text-foreground"
+          }`}
+        >
+          <ScanFace className="h-3.5 w-3.5" /> Face Recognition
+        </button>
+        <button
+          onClick={() => {
+            setAttendanceMode("qr");
+            stopCamera();
+          }}
+          className={`flex items-center gap-2 px-3.5 py-1.5 text-xs font-semibold rounded-md transition-all ${
+            attendanceMode === "qr"
+              ? "bg-background text-foreground shadow-sm"
+              : "text-muted-foreground hover:text-foreground"
+          }`}
+        >
+          <QrCode className="h-3.5 w-3.5" /> QR Code Scanner
+        </button>
+      </div>
+
+      <Card className="glass-card">
+        <CardContent className="p-4 sm:p-5 grid gap-3 md:grid-cols-2 lg:grid-cols-5">
+          <div className="space-y-1.5">
+            <Label className="text-xs">Department *</Label>
+            <TagSelect
+              value={department}
+              onChange={(v) => { setDepartment(v); setSubject(""); }}
+              options={tax.departments}
+              onCreate={addDepartment}
+              placeholder="Type or select"
+              disabled={sessionActive}
+            />
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs">Year</Label>
+            <Select value={year} onValueChange={(v) => { setYear(v); setSubject(""); }} disabled={sessionActive}>
+              <SelectTrigger><SelectValue placeholder="Any" /></SelectTrigger>
+              <SelectContent>
+                {[1, 2, 3, 4].map((y) => (
+                  <SelectItem key={y} value={String(y)}>Year {y}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs">Subject *</Label>
+            <TagSelect
+              value={subject}
+              onChange={setSubject}
+              options={subjectOptions}
+              onCreate={(v) => addSubject({ name: v, department, year: year || "1" })}
+              placeholder={department ? "Type or select" : "Pick department"}
+              disabled={!department || sessionActive}
+            />
+          </div>
+          <div className="flex items-end">
+            <Button onClick={startSession} disabled={sessionActive} className="gap-2 w-full">
+              <Play className="h-4 w-4" /> Start Session
+            </Button>
+          </div>
+          <div className="flex items-end">
+            <Button onClick={stopSession} disabled={!sessionActive} variant="destructive" className="gap-2 w-full">
+              <Square className="h-4 w-4" /> Stop Session
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+
+      <div className="grid gap-6 lg:grid-cols-3">
+        {attendanceMode === "face" ? (
+          <>
+            <Card className="glass-card lg:col-span-2 overflow-hidden">
+              <CardHeader className="flex flex-row items-center justify-between space-y-0">
+                <div>
+                  <CardTitle className="text-base flex items-center gap-2">
+                    <ScanFace className="h-4 w-4 text-primary" /> Camera Preview
+                  </CardTitle>
+                  <CardDescription>
+                    {cameraOn ? "Live feed running" : "Camera is off"}
+                    {!modelsLoaded && " (Loading face recognition models...)"}
+                  </CardDescription>
+                </div>
+                {cameraOn ? (
+                  <Button variant="secondary" size="sm" onClick={stopCamera} className="gap-2">
+                    <CameraOff className="h-4 w-4" /> Camera Off
+                  </Button>
+                ) : (
+                  <Button size="sm" onClick={startCamera} className="gap-2" disabled={!modelsLoaded}>
+                    <Camera className="h-4 w-4" /> Camera On
+                  </Button>
+                )}
+              </CardHeader>
+              <CardContent>
+                <div className="relative aspect-video rounded-xl border-2 border-dashed bg-black/90 grid place-items-center overflow-hidden">
+                  <video ref={videoRef} playsInline muted
+                    className={`absolute inset-0 h-full w-full object-cover ${cameraOn ? "block" : "hidden"}`} />
+                  {!cameraOn && (
+                    <div className="text-center text-muted-foreground">
+                      <Camera className="h-12 w-12 mx-auto mb-2 opacity-60" />
+                      <p className="text-sm">Camera is off</p>
+                    </div>
+                  )}
+                  {cameraOn && (
+                    <>
+                      <div className="absolute top-4 left-4 right-4 flex items-center justify-between z-10">
+                        <Badge className="bg-destructive/90 text-white gap-1.5">
+                          <span className="h-1.5 w-1.5 rounded-full bg-white animate-pulse" /> LIVE
+                        </Badge>
+                        {sessionActive && (
+                          <span className="text-xs text-white font-mono bg-black/50 backdrop-blur px-2 py-1 rounded">
+                            {fmtElapsed}
+                          </span>
+                        )}
+                      </div>
+                      <div className="absolute inset-12 border-2 border-primary/60 rounded-lg pointer-events-none" />
+                      <div className="absolute left-12 right-12 top-1/2 h-px bg-primary/80 shadow-[0_0_12px_var(--primary)] animate-scan" />
+                    </>
+                  )}
+                </div>
+              </CardContent>
+            </Card>
+
+            <div className="space-y-4">
+              <Card className="glass-card">
+                <CardHeader className="pb-2">
+                  <CardTitle className="text-base flex items-center gap-2">
+                    <Activity className="h-4 w-4" /> Recognition Status
+                  </CardTitle>
+                </CardHeader>
+                <CardContent className="space-y-3 text-sm">
+                  <StatusRow
+                    label="Face Detection"
+                    value={cameraOn ? (faceDetected ? "Active" : "No face") : "Off"}
+                    tone={faceDetected ? "success" : "muted"}
+                  />
+                  <StatusRow
+                    label="Recognition"
+                    value={
+                      validRegisteredEmbeddingsCount === 0 ? "No registered face embeddings available"
+                        : recog.kind === "recognized" ? "Recognized"
+                        : recog.kind === "unknown" ? "Unknown"
+                        : recog.kind === "detecting" ? "Scanning…"
+                        : "Idle"
+                    }
+                    tone={
+                      validRegisteredEmbeddingsCount === 0 ? "destructive"
+                        : recog.kind === "recognized" ? "success"
+                        : recog.kind === "unknown" ? "destructive"
+                        : "muted"
+                    }
+                  />
+                  <div className="space-y-1.5">
+                    <div className="flex justify-between text-xs">
+                      <span className="text-muted-foreground">Confidence</span>
+                      <span className="font-medium">{confidence}%</span>
+                    </div>
+                    <Progress value={confidence} className="h-2" />
+                  </div>
+
+                  {recog.kind === "recognized" && (
+                    <div className="flex items-start gap-2 rounded-lg border border-success/40 bg-success/10 p-3">
+                      <CheckCircle2 className="h-4 w-4 text-success mt-0.5" />
+                      <div className="text-xs">
+                        <p className="font-medium">Attendance marked</p>
+                        <p className="text-muted-foreground">{recog.name} · {recog.id}</p>
+                      </div>
+                    </div>
+                  )}
+                  {recog.kind === "unknown" && (
+                    <div className="flex items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/10 p-3">
+                      <AlertTriangle className="h-4 w-4 text-destructive mt-0.5" />
+                      <div className="text-xs">
+                        <p className="font-medium">Unknown face</p>
+                        <p className="text-muted-foreground">Face not registered in the system.</p>
+                      </div>
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+
+              <Card className="glass-card">
+                <CardHeader className="pb-2">
+                  <CardTitle className="text-base">Session Stats</CardTitle>
+                </CardHeader>
+                <CardContent className="grid grid-cols-3 gap-3">
+                  <Stat icon={Users} label="Present" value={String(sessionRecords.length)} />
+                  <Stat icon={Clock} label="Elapsed" value={`${Math.floor(elapsed / 60)}m`} />
+                  <Stat icon={Percent} label="Rate" value={`${rate}%`} />
+                </CardContent>
+              </Card>
+            </div>
+          </>
+        ) : (
+          /* --- QR Code Attendance Interface --- */
+          <>
+            <Card className="glass-card lg:col-span-2 overflow-hidden">
+              <CardHeader className="flex flex-row items-center justify-between space-y-0">
+                <div>
+                  <CardTitle className="text-base flex items-center gap-2">
+                    <QrCode className="h-4 w-4 text-primary" /> QR Scanner Preview
+                  </CardTitle>
+                  <CardDescription>
+                    Scan the student's unique generated QR code ID to record presence
+                  </CardDescription>
+                </div>
+                {qrScannerActive ? (
+                  <Button variant="secondary" size="sm" onClick={stopQrScanner} className="gap-2">
+                    <CameraOff className="h-4 w-4" /> Stop Scanner
+                  </Button>
+                ) : (
+                  <Button size="sm" onClick={startQrScanner} disabled={qrLoading || !sessionId} className="gap-2">
+                    <Camera className="h-4 w-4" /> Start Scanner
+                  </Button>
+                )}
+              </CardHeader>
+              <CardContent>
+                <div className="relative aspect-video rounded-xl border-2 border-dashed bg-black/90 grid place-items-center overflow-hidden">
+                  <div id="qr-scanner-mount" className={`absolute inset-0 h-full w-full object-cover ${qrScannerActive ? "block" : "hidden"}`} />
+                  {!qrScannerActive && (
+                    <div className="text-center text-muted-foreground p-4">
+                      <QrCode className="h-12 w-12 mx-auto mb-2 opacity-60" />
+                      <p className="text-sm font-medium">QR Scanner is Off</p>
+                      <p className="text-xs text-muted-foreground max-w-xs mt-1">
+                        {!sessionId ? "Start an attendance session first." : "Click 'Start Scanner' to enable camera check-in."}
+                      </p>
+                    </div>
+                  )}
+                  {qrScannerActive && (
+                    <div className="absolute top-4 left-4 z-10">
+                      <Badge className="bg-success text-success-foreground gap-1.5">
+                        <span className="h-1.5 w-1.5 rounded-full bg-white animate-pulse" /> SCANNER ACTIVE
+                      </Badge>
+                    </div>
+                  )}
+                </div>
+              </CardContent>
+            </Card>
+
+            <div className="space-y-4">
+              <Card className="glass-card">
+                <CardHeader className="pb-2">
+                  <CardTitle className="text-base flex items-center gap-2">
+                    <Activity className="h-4 w-4" /> Scan Feedback
+                  </CardTitle>
+                </CardHeader>
+                <CardContent className="space-y-3 text-sm">
+                  {scannedStudent ? (
+                    <div className="space-y-2.5">
+                      <div className="flex justify-between border-b pb-1">
+                        <span className="text-muted-foreground">Scanned Roll No:</span>
+                        <span className="font-mono font-semibold">{scannedStudent.roll_no || "N/A"}</span>
+                      </div>
+                      <div className="flex justify-between border-b pb-1">
+                        <span className="text-muted-foreground">Student Name:</span>
+                        <span className="font-semibold">{scannedStudent.name}</span>
+                      </div>
+                      <div className="flex justify-between border-b pb-1">
+                        <span className="text-muted-foreground">Department:</span>
+                        <span>{scannedStudent.department || "N/A"}</span>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="text-center py-4 text-muted-foreground text-xs">
+                      No scans executed in the current session.
+                    </div>
+                  )}
+
+                  {scanStatus.type === "success" && (
+                    <div className="flex items-start gap-2 rounded-lg border border-success/40 bg-success/10 p-3 text-success">
+                      <CheckCircle2 className="h-4 w-4 mt-0.5 shrink-0" />
+                      <div className="text-xs">
+                        <p className="font-medium">Success</p>
+                        <p className="opacity-90">{scanStatus.message}</p>
+                      </div>
+                    </div>
+                  )}
+
+                  {scanStatus.type === "error" && (
+                    <div className="flex items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-destructive">
+                      <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" />
+                      <div className="text-xs">
+                        <p className="font-medium">Access Error</p>
+                        <p className="opacity-90">{scanStatus.message}</p>
+                      </div>
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+
+              <Card className="glass-card">
+                <CardHeader className="pb-2">
+                  <CardTitle className="text-base">Session Stats</CardTitle>
+                </CardHeader>
+                <CardContent className="grid grid-cols-3 gap-3">
+                  <Stat icon={Users} label="Present" value={String(sessionRecords.length)} />
+                  <Stat icon={Clock} label="Elapsed" value={`${Math.floor(elapsed / 60)}m`} />
+                  <Stat icon={Percent} label="Rate" value={`${rate}%`} />
+                </CardContent>
+              </Card>
+            </div>
+          </>
+        )}
+      </div>
+
+      <Card className="glass-card">
+        <CardHeader><CardTitle className="text-base">Live Session Attendance</CardTitle></CardHeader>
+        <CardContent className="p-0">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Student ID</TableHead>
+                <TableHead>Name</TableHead>
+                <TableHead>Subject</TableHead>
+                <TableHead>Time</TableHead>
+                <TableHead className="text-right">Status</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {sessionRecords.length === 0 ? (
+                <TableRow>
+                  <TableCell colSpan={5} className="text-center text-sm text-muted-foreground py-10">
+                    {sessionActive ? "Waiting for check-ins…" : "Start a session to record attendance."}
+                  </TableCell>
+                </TableRow>
+              ) : (
+                sessionRecords.map((r) => (
+                  <TableRow key={r.id}>
+                    <TableCell className="font-mono text-xs">{r.studentId || r.student_id}</TableCell>
+                    <TableCell className="font-medium">{r.studentName || r.student_name}</TableCell>
+                    <TableCell>{r.subject || r.subject_id}</TableCell>
+                    <TableCell>{r.time}</TableCell>
+                    <TableCell className="text-right">
+                      <Badge className="bg-success text-success-foreground hover:bg-success/90">{r.status}</Badge>
+                    </TableCell>
+                  </TableRow>
+                ))
+              )}
+            </TableBody>
+          </Table>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+function StatusRow({ label, value, tone }: { label: string; value: string; tone: "success" | "destructive" | "muted" }) {
+  const dot = tone === "success" ? "bg-success" : tone === "destructive" ? "bg-destructive" : "bg-muted-foreground";
+  const text = tone === "success" ? "text-success" : tone === "destructive" ? "text-destructive" : "text-muted-foreground";
+  return (
+    <div className="flex items-center justify-between">
+      <span className="flex items-center gap-2 text-muted-foreground">
+        <span className={`h-2 w-2 rounded-full ${dot}`} />
+        {label}
+      </span>
+      <span className={`font-medium ${text}`}>{value}</span>
+    </div>
+  );
+}
+
+function Stat({ icon: Icon, label, value }: { icon: React.ElementType; label: string; value: string }) {
+  return (
+    <div className="rounded-lg border p-3 text-center">
+      <Icon className="h-4 w-4 mx-auto mb-1.5 text-muted-foreground" />
+      <p className="text-lg font-bold">{value}</p>
+      <p className="text-[11px] text-muted-foreground">{label}</p>
+    </div>
+  );
+}

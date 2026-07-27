@@ -1,0 +1,900 @@
+import { createFileRoute } from "@tanstack/react-router";
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  QrCode, RefreshCw, Users, Clock, Percent, Activity, CheckCircle2, AlertTriangle, Play, Square, ShieldCheck, UserCheck, ArrowRight, Lock, Loader2
+} from "lucide-react";
+import { toast } from "sonner";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { Label } from "@/components/ui/label";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Progress } from "@/components/ui/progress";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { TagSelect } from "@/components/TagSelect";
+import {
+  useTaxonomy, useStudents, useAttendance,
+  addDepartment, addSubject, addAttendance,
+} from "@/lib/store";
+import { supabase } from "@/lib/supabase";
+import { QRCodeSVG } from "qrcode.react";
+
+export const Route = createFileRoute("/_app/attendance")({         
+  head: () => ({ meta: [{ title: "QR Attendance — QRAttend" }] }),
+  component: AttendancePage,
+});
+
+// Extract URL query parameters for student scan check-in flow
+function getQueryParams() {
+  if (typeof window === "undefined") return {};
+  const params = new URLSearchParams(window.location.search);
+  return {
+    sessionId: params.get("sessionId"),
+    token: params.get("token"),
+    expiresAt: params.get("expiresAt"),
+    subject: params.get("subject"),
+    department: params.get("department"),
+    year: params.get("year"),
+  };
+}
+
+function AttendancePage() {
+  const tax = useTaxonomy();
+  const students = useStudents();
+
+  const [department, setDepartment] = useState("");
+  const [year, setYear] = useState("");
+  const [subject, setSubject] = useState("");
+
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [sessionToken, setSessionToken] = useState<string | null>(null);
+  const [expiresAt, setExpiresAt] = useState<number | null>(null);
+  const [startedAt, setStartedAt] = useState<number | null>(null);
+  const [elapsed, setElapsed] = useState(0);
+  const [timeLeft, setTimeLeft] = useState(60);
+
+  // Live session records read from Supabase
+  const [sessionRecords, setSessionRecords] = useState<any[]>([]);
+
+  // Token refresh lock ref to prevent duplicate triggers per second
+  const isRefreshingRef = useRef(false);
+
+  // Capture student flow parameters on route change
+  const [studentViewParams, setStudentViewParams] = useState<any>(null);
+
+  useEffect(() => {
+    const params = getQueryParams();
+    if (params.sessionId && params.token) {
+      setStudentViewParams(params);
+    }
+  }, []);
+
+  // 1. Resolve actual Department ID and Subject ID from names to match SQL relations
+  const resolvedDepartmentId = useMemo(() => {
+    if (!department) return null;
+    const found = tax.departments.find(
+      (d: any) => d === department || (typeof d === "object" && (d.id === department || d.name === department))
+    );
+    if (typeof found === "object" && found !== null) {
+      return found.id;
+    }
+    return found || department;
+  }, [tax.departments, department]);
+
+  const resolvedSubjectId = useMemo(() => {
+    if (!subject) return null;
+    const found = tax.subjects.find(
+      (s: any) => s === subject || (typeof s === "object" && (s.name === subject || s.id === subject))
+    );
+    if (typeof found === "object" && found !== null) {
+      return found.id;
+    }
+    return found || subject;
+  }, [tax.subjects, subject]);
+
+  const subjectOptions = useMemo(
+    () =>
+      tax.subjects
+        .filter(
+          (s: any) => {
+            const sDept = typeof s === "object" ? s.department : null;
+            const sYear = typeof s === "object" ? s.year : null;
+            return (!department || sDept === department || sDept === resolvedDepartmentId) &&
+                   (!year || String(sYear) === String(year));
+          }
+        )
+        .map((s: any) => (typeof s === "object" ? s.name : s)),
+    [tax.subjects, department, resolvedDepartmentId, year],
+  );
+
+  const eligibleStudents = useMemo(
+    () =>
+      students.filter(
+        (s) =>
+          (!resolvedDepartmentId || s.department === resolvedDepartmentId || s.department === department) &&
+          (!year || String(s.year) === String(year)),
+      ),
+    [students, department, resolvedDepartmentId, year],
+  );
+
+  // Fetch session attendance records from database
+  const fetchSessionRecords = async (sid: string) => {
+    if (!sid) return;
+    try {
+      const { data, error } = await supabase
+        .from("attendance_records")
+        .select("id, student_id, subject_id, date, time, status")
+        .eq("session_id", sid);
+
+      if (error) throw error;
+      setSessionRecords(data || []);
+    } catch (err) {
+      console.error("[Fetch Records] Database error:", err);
+    }
+  };
+
+  // Realtime subscription & Fallback polling for live updates
+  useEffect(() => {
+    if (!sessionId) {
+      setSessionRecords([]);
+      return;
+    }
+
+    fetchSessionRecords(sessionId);
+
+    // Setup Supabase Realtime channel
+    const channel = supabase
+      .channel(`live-attendance-${sessionId}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "INSERT",
+          schema: "public",
+          table: "attendance_records",
+          filter: `session_id=eq.${sessionId}`,
+        },
+        (payload) => {
+          setSessionRecords((prev) => {
+            if (prev.some((r) => r.id === payload.new.id)) return prev;
+            return [...prev, payload.new];
+          });
+        }
+      )
+      .subscribe();
+
+    const pollInterval = setInterval(() => {
+      fetchSessionRecords(sessionId);
+    }, 5000);
+
+    return () => {
+      supabase.removeChannel(channel);
+      clearInterval(pollInterval);
+    };
+  }, [sessionId]);
+
+  // Active session clock and single-event token rotator
+  useEffect(() => {
+    if (!sessionId || !startedAt || !expiresAt) return;
+
+    const interval = setInterval(() => {
+      setElapsed(Math.floor((Date.now() - startedAt) / 1000));
+
+      const remaining = Math.max(0, Math.round((expiresAt - Date.now()) / 1000));
+      setTimeLeft(remaining);
+
+      // Mutex locked dynamic refresh
+      if (remaining <= 0 && !isRefreshingRef.current) {
+        isRefreshingRef.current = true;
+        const newToken = crypto.randomUUID();
+        const newExpiry = Date.now() + 60000;
+        const newExpiryIso = new Date(newExpiry).toISOString();
+
+        supabase
+          .from("attendance_sessions")
+          .update({
+            session_token: newToken,
+            expires_at: newExpiryIso,
+          })
+          .eq("id", sessionId)
+          .then(({ error }) => {
+            isRefreshingRef.current = false;
+            if (error) {
+              console.error("[Token Refresh] Sync error:", error);
+              toast.error("Failed to sync security token with database");
+            } else {
+              setSessionToken(newToken);
+              setExpiresAt(newExpiry);
+              setTimeLeft(60);
+              toast.info("Secure QR Code refreshed");
+            }
+          })
+          .catch(() => {
+            isRefreshingRef.current = false;
+          });
+      }
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [sessionId, startedAt, expiresAt]);
+
+  const startSession = async () => {
+    if (!department || !subject) {
+      toast.error("Department and Subject are required");
+      return;
+    }
+
+    const sid = `QR-S-${Date.now()}`;
+    const initialToken = crypto.randomUUID();
+    const expiryDate = new Date(Date.now() + 60000);
+
+    try {
+      const { error } = await supabase.from("attendance_sessions").insert({
+        id: sid,
+        department_id: resolvedDepartmentId,
+        subject_id: resolvedSubjectId,
+        year: year || null,
+        session_token: initialToken,
+        expires_at: expiryDate.toISOString(),
+        is_active: true,
+      });
+
+      if (error) throw error;
+
+      setSessionId(sid);
+      setSessionToken(initialToken);
+      setExpiresAt(expiryDate.getTime());
+      setStartedAt(Date.now());
+      setElapsed(0);
+      setTimeLeft(60);
+      toast.success("Secure Dynamic QR Session started");
+    } catch (err: any) {
+      console.error("[Start Session] Error:", err);
+      toast.error(`Failed to start session: ${err.message || err}`);
+    }
+  };
+
+  const stopSession = async () => {
+    if (!sessionId) return;
+    try {
+      const { error } = await supabase
+        .from("attendance_sessions")
+        .update({ is_active: false })
+        .eq("id", sessionId);
+
+      if (error) throw error;
+
+      setSessionId(null);
+      setSessionToken(null);
+      setExpiresAt(null);
+      setStartedAt(null);
+      toast("Session stopped");
+    } catch (err: any) {
+      console.error("[Stop Session] Error:", err);
+      toast.error("Failed to terminate session in database");
+    }
+  };
+
+  // Compile check-in URL payload with local domain resolution
+  const qrUrl = useMemo(() => {
+    if (!sessionId || !sessionToken || !expiresAt) return "";
+    const baseUrl = typeof window !== "undefined" ? window.location.origin : "http://localhost:8084";
+    return `${baseUrl}/attendance?sessionId=${sessionId}&token=${sessionToken}&expiresAt=${expiresAt}&subject=${encodeURIComponent(subject)}&department=${encodeURIComponent(department)}&year=${year}`;
+  }, [sessionId, sessionToken, expiresAt, subject, department, year]);
+
+  const rate = eligibleStudents.length
+    ? Math.round((sessionRecords.length / eligibleStudents.length) * 100)
+    : 0;
+
+  const fmtElapsed = `${String(Math.floor(elapsed / 3600)).padStart(2, "0")}:${String(
+    Math.floor((elapsed % 3600) / 60),
+  ).padStart(2, "0")}:${String(elapsed % 60).padStart(2, "0")}`;
+
+  const sessionActive = !!sessionId;
+
+  if (studentViewParams) {
+    return (
+      <StudentCheckInView
+        params={studentViewParams}
+        studentsList={students}
+        onComplete={() => {
+          if (typeof window !== "undefined") {
+            const url = new URL(window.location.href);
+            url.search = "";
+            window.history.replaceState({}, document.title, url.toString());
+            setStudentViewParams(null);
+          }
+        }}
+      />
+    );
+  }
+
+  return (
+    <div className="max-w-7xl mx-auto space-y-6">
+      <div className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-4">
+        <div>
+          <h2 className="text-2xl ly-bold tracking-tight">Live QR Attendance</h2>
+          <p className="text-sm text-muted-foreground">Start a session and generate a secure dynamic QR code for student check-in.</p>
+        </div>
+        <div className="flex items-center gap-2">
+          <Badge variant={sessionActive ? "default" : "secondary"} className="gap-1.5">
+            <span className={`h-1.5 w-1.5 rounded-full ${sessionActive ? "bg-success animate-pulse" : "bg-muted-foreground"}`} />
+            {sessionActive ? "Session Active" : "Idle"}
+          </Badge>
+        </div>
+      </div>
+
+      <Card className="glass-card">
+        <CardContent className="p-4 sm:p-5 grid gap-3 md:grid-cols-2 lg:grid-cols-5">
+          <div className="space-y-1.5">
+            <Label className="text-xs">Department *</Label>
+            <TagSelect
+              value={department}
+              onChange={(v) => { setDepartment(v); setSubject(""); }}
+              options={tax.departments}
+              onCreate={addDepartment}
+              placeholder="Type or select"
+              disabled={sessionActive}
+            />
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs">Year</Label>
+            <Select value={year} onValueChange={(v) => { setYear(v); setSubject(""); }} disabled={sessionActive}>
+              <SelectTrigger><SelectValue placeholder="Any" /></SelectTrigger>
+              <SelectContent>
+                {[1, 2, 3, 4].map((y) => (
+                  <SelectItem key={y} value={String(y)}>Year {y}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs">Subject *</Label>
+            <TagSelect
+              value={subject}
+              onChange={setSubject}
+              options={subjectOptions}
+              onCreate={(v) => addSubject({ name: v, department, year: year || "1" })}
+              placeholder={department ? "Type or select" : "Pick department"}
+              disabled={!department || sessionActive}
+            />
+          </div>
+          <div className="flex items-end">
+            <Button onClick={startSession} disabled={sessionActive} className="gap-2 w-full bg-primary text-primary-foreground">
+              <Play className="h-4 w-4" /> Start Session
+            </Button>
+          </div>
+          <div className="flex items-end">
+            <Button onClick={stopSession} disabled={!sessionActive} variant="destructive" className="gap-2 w-full">
+              <Square className="h-4 w-4" /> Stop Session
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+
+      <div className="grid gap-6 lg:grid-cols-3">
+        <Card className="glass-card lg:col-span-2 overflow-hidden">
+          <CardHeader className="flex flex-row items-center justify-between space-y-0">
+            <div>
+              <CardTitle className="text-base flex items-center gap-2">
+                <QrCode className="h-4 w-4 text-primary" /> Attendance QR Display
+              </CardTitle>
+              <CardDescription>
+                {sessionActive ? "Dynamic token-secured QR code" : "QR generation inactive"}
+              </CardDescription>
+            </div>
+          </CardHeader>
+          <CardContent>
+            <div className="relative aspect-video rounded-xl border-2 border-dashed bg-black/90 grid place-items-center overflow-hidden">
+              {sessionActive ? (
+                <div className="flex flex-col items-center justify-center p-4 bg-white rounded-lg shadow-lg">
+                  {/* Local dynamic QR render with no external API dependencies */}
+                  <QRCodeSVG
+                    value={qrUrl}
+                    size={220}
+                    level="H"
+                    includeMargin={true}
+                    className="w-48 h-48 sm:w-56 sm:h-56"
+                  />
+                  <span className="text-black text-[10px] font-mono mt-2 select-all max-w-[200px] truncate">
+                    {sessionToken?.substring(0, 18)}...
+                  </span>
+                </div>
+              ) : (
+                <div className="text-center text-muted-foreground p-6">
+                  <QrCode className="h-12 w-12 mx-auto mb-2 opacity-60" />
+                  <p className="text-sm font-medium">Session Inactive</p>
+                  <p className="text-xs max-w-sm mt-1 opacity-70">
+                    Select a department and subject above, then click Start Session to begin tracking live attendance.
+                  </p>
+                </div>
+              )}
+              {sessionActive && (
+                <>
+                  <div className="absolute top-4 left-4 right-4 flex items-center justify-between z-10">
+                    <Badge className="bg-success text-success-foreground gap-1.5">
+                      <span className="h-1.5 w-1.5 rounded-full bg-white animate-pulse" /> SCAN TO REGISTER
+                    </Badge>
+                    <span className="text-xs text-white font-mono bg-black/50 backdrop-blur px-2 py-1 rounded">
+                      Elapsed: {fmtElapsed}
+                    </span>
+                  </div>
+                </>
+              )}
+            </div>
+          </CardContent>
+        </Card>
+
+        <div className="space-y-4">
+          <Card className="glass-card">
+            <CardHeader className="pb-2">
+              <CardTitle className="text-base flex items-center gap-2">
+                <Activity className="h-4 w-4" /> QR Session Status
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-3 text-sm">
+              <StatusRow
+                label="Dynamic Sync"
+                value={sessionActive ? "Active" : "Offline"}
+                tone={sessionActive ? "success" : "muted"}
+              />
+              <StatusRow
+                label="Security Key"
+                value={sessionActive && sessionToken ? `${sessionToken.substring(0, 8)}...` : "None"}
+                tone={sessionActive ? "success" : "muted"}
+              />
+              <div className="space-y-1.5">
+                <div className="flex justify-between text-xs">
+                  <span className="text-muted-foreground flex items-center gap-1">
+                    <RefreshCw className={`h-3 w-3 ${sessionActive ? "animate-spin" : ""}`} /> Code Refresh Tracker
+                  </span>
+                  <span className="font-medium">{timeLeft}s remaining</span>
+                </div>
+                <Progress value={(timeLeft / 60) * 100} className="h-2" />
+              </div>
+
+              {sessionActive ? (
+                <div className="flex items-start gap-2 rounded-lg border border-success/40 bg-success/10 p-3">
+                  <ShieldCheck className="h-4 w-4 text-success mt-0.5" />
+                  <div className="text-xs">
+                    <p className="font-medium">Anti-tamper protection active</p>
+                    <p className="text-muted-foreground">Tokens are evaluated through remote RLS structures and verified against active DB registers.</p>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex items-start gap-2 rounded-lg border border-dashed p-3">
+                  <AlertTriangle className="h-4 w-4 text-muted-foreground mt-0.5" />
+                  <div className="text-xs text-muted-foreground">
+                    <p className="font-medium">No Active Session</p>
+                    <p>Start a dynamic QR session to broadcast real-time attendance credentials.</p>
+                  </div>
+                </div>
+              )}
+            </CardContent>
+          </Card>
+
+          <Card className="glass-card">
+            <CardHeader className="pb-2">
+              <CardTitle className="text-base">Session Stats</CardTitle>
+            </CardHeader>
+            <CardContent className="grid grid-cols-3 gap-3">
+              <Stat icon={Users} label="Present" value={String(sessionRecords.length)} />
+              <Stat icon={Clock} label="Elapsed" value={`${Math.floor(elapsed / 60)}m`} />
+              <Stat icon={Percent} label="Rate" value={`${rate}%`} />
+            </CardContent>
+          </Card>
+        </div>
+      </div>
+
+      <Card className="glass-card">
+        <CardHeader><CardTitle className="text-base">Live Session Attendance</CardTitle></CardHeader>
+        <CardContent className="p-0">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Student ID</TableHead>
+                <TableHead>Name</TableHead>
+                <TableHead>Subject</TableHead>
+                <TableHead>Time</TableHead>
+                <TableHead className="text-right">Status</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {sessionRecords.length === 0 ? (
+                <TableRow>
+                  <TableCell colSpan={5} className="text-center text-sm text-muted-foreground py-10">
+                    {sessionActive ? "Waiting for QR check-ins…" : "Start a session to record attendance."}
+                  </TableCell>
+                </TableRow>
+              ) : (
+                sessionRecords.map((r) => {
+                  const sInfo = students.find((s) => s.id === r.student_id);
+                  const nameStr = sInfo ? sInfo.name : "Unregistered Student";
+                  return (
+                    <TableRow key={r.id}>
+                      <TableCell className="font-mono text-xs">{r.student_id}</TableCell>
+                      <TableCell className="font-medium">{nameStr}</TableCell>
+                      <TableCell>{subject || r.subject_id}</TableCell>
+                      <TableCell>{r.time}</TableCell>
+                      <TableCell className="text-right">
+                        <Badge className="bg-success text-success-foreground hover:bg-success/90">{r.status}</Badge>
+                      </TableCell>
+                    </TableRow>
+                  );
+                })
+              )}
+            </TableBody>
+          </Table>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+// =========================================================================
+// Student Check-In Interface
+// =========================================================================
+interface StudentCheckInProps {
+  params: {
+    sessionId: string;
+    token: string;
+    expiresAt: string;
+    subject: string;
+    department: string;
+    year: string;
+  };
+  studentsList: any[];
+  onComplete: () => void;
+}
+
+function StudentCheckInView({ params, studentsList, onComplete }: StudentCheckInProps) {
+  const tax = useTaxonomy();
+  const [currentUser, setCurrentUser] = useState<any>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+
+  // Verification states
+  const [verifying, setVerifying] = useState(true);
+  const [verificationError, setVerificationError] = useState<string | null>(null);
+
+  // Input fields
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [submitted, setSubmitted] = useState(false);
+
+  // Get session on mount
+  useEffect(() => {
+    supabase.auth.getUser().then(({ data: { user } }) => {
+      setCurrentUser(user);
+      setAuthLoading(false);
+    });
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setCurrentUser(session?.user ?? null);
+      setAuthLoading(false);
+    });
+
+    return () => subscription.unsubscribe();
+  }, []);
+
+  // 1. Resolve student-side subject name/ID from taxonomy store
+  const resolvedSubjectId = useMemo(() => {
+    if (!params.subject) return null;
+    const found = tax.subjects.find(
+      (s: any) => s === params.subject || (typeof s === "object" && (s.name === params.subject || s.id === params.subject))
+    );
+    if (typeof found === "object" && found !== null) {
+      return found.id;
+    }
+    return found || params.subject;
+  }, [tax.subjects, params.subject]);
+
+  const resolvedDepartmentId = useMemo(() => {
+    if (!params.department) return null;
+    const found = tax.departments.find(
+      (d: any) => d === params.department || (typeof d === "object" && (d.id === params.department || d.name === params.department))
+    );
+    if (typeof found === "object" && found !== null) {
+      return found.id;
+    }
+    return found || params.department;
+  }, [tax.departments, params.department]);
+
+  // Server-side validation of active session credentials
+  useEffect(() => {
+    const verifySessionInDatabase = async () => {
+      try {
+        setVerifying(true);
+        const { data: session, error } = await supabase
+          .from("attendance_sessions")
+          .select("*")
+          .eq("id", params.sessionId)
+          .single();
+
+        if (error || !session) {
+          setVerificationError("Attendance session not found or invalid.");
+          return;
+        }
+
+        if (!session.is_active) {
+          setVerificationError("This attendance session is no longer active.");
+          return;
+        }
+
+        if (session.session_token !== params.token) {
+          setVerificationError("The scan token has expired. Request the current QR code.");
+          return;
+        }
+
+        // Validate timestamp boundaries (allowing 15-second networking window)
+        const expiresTime = new Date(session.expires_at).getTime();
+        if (Date.now() > expiresTime + 15000) {
+          setVerificationError("Dynamic QR code session has expired.");
+          return;
+        }
+
+        setVerificationError(null);
+      } catch (err) {
+        setVerificationError("Unable to resolve authentication values from database.");
+      } finally {
+        setVerifying(false);
+      }
+    };
+
+    verifySessionInDatabase();
+  }, [params.sessionId, params.token]);
+
+  const currentStudentProfile = useMemo(() => {
+    if (!currentUser) return null;
+    return studentsList.find((s) => s.email === currentUser.email);
+  }, [currentUser, studentsList]);
+
+  const handleLogin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!email || !password) {
+      toast.error("Account email and password required.");
+      return;
+    }
+    setSubmitting(true);
+    try {
+      const { error } = await supabase.auth.signInWithPassword({ email, password });
+      if (error) throw error;
+      toast.success("Log in successful");
+    } catch (err: any) {
+      toast.error(`Access credentials invalid: ${err.message || err}`);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleRegisterAttendance = async () => {
+    if (!currentStudentProfile) {
+      toast.error("Unable to verify profile identity.");
+      return;
+    }
+
+    setSubmitting(true);
+
+    const sDept = currentStudentProfile.department;
+    const sYear = String(currentStudentProfile.year);
+
+    // Validate matching Academic Boundaries
+    if (resolvedDepartmentId && sDept !== resolvedDepartmentId && sDept !== params.department) {
+      toast.error(`Department mismatch error: Course requires ${params.department}`);
+      setSubmitting(false);
+      return;
+    }
+
+    if (params.year && sYear !== String(params.year)) {
+      toast.error(`Enrollment mismatch error: Session requires Academic Year ${params.year}`);
+      setSubmitting(false);
+      return;
+    }
+
+    const now = new Date();
+    // 3. Exact column names used for insert operation
+    const payload = {
+      id: crypto.randomUUID(),
+      session_id: params.sessionId,
+      student_id: currentStudentProfile.id,
+      subject_id: resolvedSubjectId || params.subject,
+      date: now.toISOString().slice(0, 10),
+      time: now.toTimeString().slice(0, 8),
+      status: "Present",
+    };
+
+    try {
+      // 6. Direct writing to actual Supabase table to avoid local mock bypasses
+      const { error } = await supabase.from("attendance_records").insert(payload);
+
+      if (error) {
+        // 5. Handle DB-level unique constraints
+        const errMsg = error.message.toLowerCase();
+        if (errMsg.includes("unique") || errMsg.includes("duplicate") || error.code === "23505") {
+          toast.error("Your attendance has already been registered for this session.");
+        } else {
+          toast.error(`Check-in transaction aborted: ${error.message}`);
+        }
+        setSubmitting(false);
+        return;
+      }
+
+      setSubmitted(true);
+      toast.success("Attendance checked in!");
+    } catch (err: any) {
+      console.error(err);
+      toast.error("Check-in request failed. Try again.");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const isLoggingOut = useRef(false);
+  const handleLogout = async () => {
+    if (isLoggingOut.current) return;
+    isLoggingOut.current = true;
+    try {
+      await supabase.auth.signOut();
+      toast.info("Signed out");
+    } catch (err) {
+      console.error(err);
+    } finally {
+      isLoggingOut.current = false;
+    }
+  };
+
+  const loading = authLoading || verifying;
+
+  return (
+    <div className="min-h-[80vh] flex items-center justify-center p-4">
+      <Card className="glass-card max-w-md w-full border border-primary/20 shadow-2xl">
+        <CardHeader className="text-center pb-4">
+          <div className="mx-auto w-12 h-12 bg-primary/10 rounded-full flex items-center justify-center mb-2">
+            <UserCheck className="h-6 w-6 text-primary" />
+          </div>
+          <CardTitle className="text-xl">Student Check-In</CardTitle>
+          <CardDescription>Verify your credentials to register class attendance</CardDescription>
+        </CardHeader>
+
+        <CardContent className="space-y-4">
+          <div className="rounded-lg bg-secondary/40 p-4 border space-y-2 text-sm">
+            <div className="flex justify-between">
+              <span className="text-muted-foreground">Subject</span>
+              <span className="font-semibold">{params.subject}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-muted-foreground">Department</span>
+              <span className="font-semibold">{params.department}</span>
+            </div>
+            {params.year && (
+              <div className="flex justify-between">
+                <span className="text-muted-foreground">Academic Year</span>
+                <span className="font-semibold">Year {params.year}</span>
+              </div>
+            )}
+          </div>
+
+          {loading ? (
+            <div className="flex flex-col items-center justify-center py-8 space-y-2">
+              <Loader2 className="h-8 w-8 text-primary animate-spin" />
+              <p className="text-xs text-muted-foreground">Verifying session token...</p>
+            </div>
+          ) : verificationError ? (
+            <div className="flex items-start gap-2.5 rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">
+              <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" />
+              <div>
+                <p className="font-semibold">Invalid QR Scan</p>
+                <p className="text-xs opacity-90 mt-0.5">{verificationError}</p>
+              </div>
+            </div>
+          ) : submitted ? (
+            <div className="space-y-4 text-center py-4">
+              <div className="mx-auto w-12 h-12 bg-success/10 rounded-full flex items-center justify-center">
+                <CheckCircle2 className="h-6 w-6 text-success animate-bounce" />
+              </div>
+              <div>
+                <h4 className="font-bold text-success">Attendance Recorded!</h4>
+                <p className="text-xs text-muted-foreground mt-1">Your check-in has been successfully registered.</p>
+              </div>
+              <Button onClick={onComplete} className="w-full gap-2 mt-2">
+                Close Check-In <ArrowRight className="h-4 w-4" />
+              </Button>
+            </div>
+          ) : !currentUser ? (
+            <form onSubmit={handleLogin} className="space-y-4">
+              <div className="text-center pb-2">
+                <Badge variant="outline" className="gap-1 border-primary/30 text-xs">
+                  <Lock className="h-3 w-3" /> Auth Required
+                </Badge>
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="email" className="text-xs">University Email</Label>
+                <input
+                  id="email"
+                  type="email"
+                  required
+                  placeholder="name@university.edu"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="password" className="text-xs">Password</Label>
+                <input
+                  id="password"
+                  type="password"
+                  required
+                  placeholder="••••••••"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                />
+              </div>
+              <Button type="submit" disabled={submitting} className="w-full mt-2">
+                {submitting ? "Logging in..." : "Login & Continue"}
+              </Button>
+            </form>
+          ) : !currentStudentProfile ? (
+            <div className="space-y-4 py-2">
+              <div className="flex items-start gap-2.5 rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">
+                <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" />
+                <div>
+                  <p className="font-semibold">Identification Failed</p>
+                  <p className="text-xs opacity-90 mt-0.5">Logged in as {currentUser.email}, but this account is not registered on the student roster.</p>
+                </div>
+              </div>
+              <Button onClick={handleLogout} variant="outline" className="w-full">
+                Logout & Use Other Account
+              </Button>
+            </div>
+          ) : (
+            <div className="space-y-4 pt-2">
+              <div className="rounded-lg border p-3 bg-secondary/10 space-y-1 text-sm">
+                <p className="text-xs text-muted-foreground">Authenticated Account</p>
+                <p className="font-bold text-primary">{currentStudentProfile.name}</p>
+                <p className="text-xs font-mono text-muted-foreground">ID: {currentStudentProfile.id} · {currentStudentProfile.email}</p>
+              </div>
+
+              <div className="space-y-2">
+                <Button
+                  onClick={handleRegisterAttendance}
+                  disabled={submitting}
+                  className="w-full gap-2 font-semibold"
+                >
+                  {submitting ? "Registering..." : "Confirm Presence"}
+                </Button>
+                <Button onClick={handleLogout} variant="ghost" size="sm" className="w-full text-muted-foreground hover:text-foreground">
+                  Logout of current account
+                </Button>
+              </div>
+            </div>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+function StatusRow({ label, value, tone }: { label: string; value: string; tone: "success" | "destructive" | "muted" }) {
+  const dot = tone === "success" ? "bg-success" : tone === "destructive" ? "bg-destructive" : "bg-muted-foreground";
+  const text = tone === "success" ? "text-success" : tone === "destructive" ? "text-destructive" : "text-muted-foreground";
+  return (
+    <div className="flex items-center justify-between">
+      <span className="flex items-center gap-2 text-muted-foreground">
+        <span className={`h-2 w-2 rounded-full ${dot}`} />
+        {label}
+      </span>
+      <span className={`font-medium ${text}`}>{value}</span>
+    </div>
+  );
+}
+
+function Stat({ icon: Icon, label, value }: { icon: React.ElementType; label: string; value: string }) {
+  return (
+    <div className="rounded-lg border p-3 text-center">
+      <Icon className="h-4 w-4 mx-auto mb-1.5 text-muted-foreground" />
+      <p className="text-lg font-bold">{value}</p>
+      <p className="text-[11px] text-muted-foreground">{label}</p>
+    </div>
+  );
+}

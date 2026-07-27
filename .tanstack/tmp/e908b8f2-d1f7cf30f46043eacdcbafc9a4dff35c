@@ -1,0 +1,1023 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { createFileRoute } from '@tanstack/react-router';
+import {
+  QrCode,
+  Camera,
+  Play,
+  Square,
+  CheckCircle2,
+  XCircle,
+  AlertCircle,
+  Users,
+  Clock,
+  BookOpen,
+  Building,
+  GraduationCap,
+  FileText,
+  BarChart3,
+  Download,
+  Search,
+  RefreshCw,
+  Check,
+  User,
+  LayoutDashboard,
+  Printer,
+  X
+} from 'lucide-react';
+import { createClient } from '@supabase/supabase-js';
+
+// --- Supabase Client Setup (Optional / Configurable) ---
+const SUPABASE_URL = process.env.REACT_APP_SUPABASE_URL || '';
+const SUPABASE_ANON_KEY = process.env.REACT_APP_SUPABASE_ANON_KEY || '';
+const supabase = (SUPABASE_URL && SUPABASE_ANON_KEY) 
+  ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY) 
+  : null;
+
+// --- Interfaces & Types ---
+export interface Department {
+  id: string;
+  name: string;
+}
+
+export interface YearOption {
+  id: string;
+  label: string;
+}
+
+export interface Subject {
+  id: string;
+  name: string;
+  code: string;
+}
+
+export interface Student {
+  id: string;
+  studentId: string;
+  name: string;
+  department: string;
+  year: string;
+  email?: string;
+  qrCodeUrl?: string;
+}
+
+export interface AttendanceRecord {
+  id: string;
+  studentId: string;
+  studentName: string;
+  department: string;
+  year: string;
+  subject: string;
+  timestamp: string;
+  date: string;
+  status: 'PRESENT' | 'LATE';
+}
+
+export interface SessionStats {
+  totalEnrolled: number;
+  totalPresent: number;
+  totalAbsent: number;
+  attendanceRate: number;
+}
+
+interface NotificationState {
+  type: 'success' | 'error' | 'warning' | 'info';
+  message: string;
+}
+
+// --- Initial Mock Data Fallbacks ---
+const DEPARTMENTS: Department[] = [
+  { id: 'CS', name: 'Computer Science & Engineering' },
+  { id: 'IT', name: 'Information Technology' },
+  { id: 'ECE', name: 'Electronics & Communication' },
+  { id: 'ME', name: 'Mechanical Engineering' }
+];
+
+const YEARS: YearOption[] = [
+  { id: '1', label: '1st Year' },
+  { id: '2', label: '2nd Year' },
+  { id: '3', label: '3rd Year' },
+  { id: '4', label: '4th Year' }
+];
+
+const SUBJECTS: Subject[] = [
+  { id: 'CS301', name: 'Data Structures & Algorithms', code: 'CS301' },
+  { id: 'CS302', name: 'Database Management Systems', code: 'CS302' },
+  { id: 'CS303', name: 'Web Development Frameworks', code: 'CS303' },
+  { id: 'IT201', name: 'Object Oriented Programming', code: 'IT201' }
+];
+
+const INITIAL_STUDENTS: Student[] = [
+  { id: '1', studentId: 'STU001', name: 'Alex Johnson', department: 'Computer Science & Engineering', year: '3rd Year', email: 'alex@univ.edu' },
+  { id: '2', studentId: 'STU002', name: 'Sophia Smith', department: 'Computer Science & Engineering', year: '3rd Year', email: 'sophia@univ.edu' },
+  { id: '3', studentId: 'STU003', name: 'Liam Williams', department: 'Information Technology', year: '2nd Year', email: 'liam@univ.edu' },
+  { id: '4', studentId: 'STU004', name: 'Emma Brown', department: 'Computer Science & Engineering', year: '3rd Year', email: 'emma@univ.edu' },
+  { id: '5', studentId: 'STU005', name: 'Noah Davis', department: 'Electronics & Communication', year: '4th Year', email: 'noah@univ.edu' }
+];
+
+export const QRAttendanceModule: React.FC = () => {
+  // --- Navigation Tab State ---
+  const [activeTab, setActiveTab] = useState<'live' | 'records' | 'reports' | 'students' | 'dashboard'>('live');
+
+  // --- Dropdown States ---
+  const [selectedDepartment, setSelectedDepartment] = useState<string>(DEPARTMENTS[0].id);
+  const [selectedYear, setSelectedYear] = useState<string>(YEARS[2].id);
+  const [selectedSubject, setSelectedSubject] = useState<string>(SUBJECTS[0].id);
+
+  // --- Session Controls ---
+  const [isSessionActive, setIsSessionActive] = useState<boolean>(false);
+  const [sessionStartTime, setSessionStartTime] = useState<string | null>(null);
+
+  // --- QR Scanner States ---
+  const [isScannerRunning, setIsScannerRunning] = useState<boolean>(false);
+  const [scannerStatus, setScannerStatus] = useState<string>('QR Scanner is off');
+  const [manualInput, setManualInput] = useState<string>('');
+  const qrScannerRef = useRef<Html5Qrcode | null>(null);
+  const scannerContainerId = 'qr-reader-viewport';
+
+  // --- Data States ---
+  const [students, setStudents] = useState<Student[]>(INITIAL_STUDENTS);
+  const [liveAttendanceList, setLiveAttendanceList] = useState<AttendanceRecord[]>([]);
+  const [allAttendanceRecords, setAllAttendanceRecords] = useState<AttendanceRecord[]>([]);
+  const [scannedStudentIds, setScannedStudentIds] = useState<Set<string>>(new Set());
+  const [notification, setNotification] = useState<NotificationState | null>(null);
+  const [searchQuery, setSearchQuery] = useState<string>('');
+  const [selectedStudentForQRCard, setSelectedStudentForQRCard] = useState<Student | null>(null);
+
+  // Notification Auto-dismiss
+  useEffect(() => {
+    if (notification) {
+      const timer = setTimeout(() => setNotification(null), 4000);
+      return () => clearTimeout(timer);
+    }
+  }, [notification]);
+
+  // Load Initial Database Data from Supabase if configured
+  useEffect(() => {
+    fetchDatabaseData();
+  }, []);
+
+  // Clean up scanner hardware on component unmount
+  useEffect(() => {
+    return () => {
+      stopQRScanner();
+    };
+  }, []);
+
+  // --- Supabase Data Fetching ---
+  const fetchDatabaseData = async () => {
+    if (!supabase) return;
+    try {
+      const { data: studentData } = await supabase.from('students').select('*');
+      if (studentData && studentData.length > 0) {
+        setStudents(studentData);
+      }
+
+      const { data: recordsData } = await supabase.from('attendance').select('*').order('created_at', { ascending: false });
+      if (recordsData && recordsData.length > 0) {
+        setAllAttendanceRecords(recordsData);
+      }
+    } catch (error) {
+      console.warn('Supabase fetch notice: using local state fallback.', error);
+    }
+  };
+
+  // --- QR Scanner Hardware Control ---
+  const startQRScanner = async () => {
+    if (!isSessionActive) {
+      setNotification({
+        type: 'warning',
+        message: 'Please click "Start Session" before turning on the QR Scanner.'
+      });
+      return;
+    }
+
+    try {
+      setScannerStatus('Initializing Camera...');
+
+      if (qrScannerRef.current) {
+        await stopQRScanner();
+      }
+
+      const html5QrCode = new Html5Qrcode(scannerContainerId);
+      qrScannerRef.current = html5QrCode;
+
+      const config = { fps: 10, qrbox: { width: 250, height: 250 } };
+
+      await html5QrCode.start(
+        { facingMode: 'environment' },
+        config,
+        (decodedText) => {
+          handleQRScanSuccess(decodedText);
+        },
+        () => {
+          // Continuous scanning ticks
+        }
+      );
+
+      setIsScannerRunning(true);
+      setScannerStatus('QR Scanner Active - Ready to Scan');
+    } catch (err) {
+      console.error('Failed to start camera for QR scanner:', err);
+      setScannerStatus('Camera access denied or unavailable');
+      setIsScannerRunning(false);
+    }
+  };
+
+  const stopQRScanner = async () => {
+    if (qrScannerRef.current) {
+      try {
+        if (qrScannerRef.current.isScanning) {
+          await qrScannerRef.current.stop();
+        }
+        qrScannerRef.current.clear();
+      } catch (err) {
+        console.error('Error stopping QR scanner:', err);
+      } finally {
+        qrScannerRef.current = null;
+        setIsScannerRunning(false);
+        setScannerStatus('QR Scanner is off');
+      }
+    }
+  };
+
+
+  // --- Session Control Actions ---
+  const handleStartSession = () => {
+    setIsSessionActive(true);
+    setSessionStartTime(new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+    setNotification({
+      type: 'info',
+      message: 'Attendance Session Started. Click "Start QR Scanner" to begin scanning.'
+    });
+  };
+
+  const handleStopSession = async () => {
+    await stopQRScanner();
+    setIsSessionActive(false);
+    setNotification({
+      type: 'info',
+      message: 'Attendance Session Stopped.'
+    });
+  };
+// --- Verify Scanned QR Against Registered Students ---
+const handleQRScanSuccess = async (scannedData: string) => {
+  if (!isSessionActive) {
+    setNotification({
+      type: 'warning',
+      message: 'No active session. Please start session first.'
+    });
+    return;
+  }
+
+  // Extract QR ID
+  let extractedId = scannedData.trim();
+
+  try {
+    if (extractedId.startsWith('{') && extractedId.endsWith('}')) {
+      const parsed = JSON.parse(extractedId);
+
+      extractedId = String(
+        parsed.student_id ||
+        parsed.studentId ||
+        parsed.id ||
+        extractedId
+      ).trim();
+    }
+  } catch {
+    // normal text QR
+  }
+
+  const cleanedId = extractedId.toLowerCase();
+
+  console.log("QR Scanned ID:", cleanedId);
+  console.log("Students:", students);
+
+
+  // Duplicate check
+  if (scannedStudentIds.has(cleanedId)) {
+    setNotification({
+      type: 'warning',
+      message: `Student ID "${extractedId}" already marked present.`
+    });
+    return;
+  }
+
+
+  // Student verification
+  const matchedStudent = students.find((s) =>
+    String(s.studentId).toLowerCase() === cleanedId
+  );
+
+
+  if (!matchedStudent) {
+    setNotification({
+      type: 'error',
+      message: `Student ID "${extractedId}" is not registered.`
+    });
+    return;
+  }
+
+
+  // Attendance creation
+  const now = new Date();
+
+  const newRecord: AttendanceRecord = {
+    id: `ATT-${Date.now()}`,
+    studentId: matchedStudent.studentId,
+    studentName: matchedStudent.name,
+    department: matchedStudent.department,
+    year: matchedStudent.year,
+    subject:
+      SUBJECTS.find((s)=>s.id===selectedSubject)?.name ||
+      selectedSubject,
+    timestamp: now.toLocaleTimeString(),
+    date: now.toISOString().split('T')[0],
+    status:'PRESENT'
+  };
+
+
+  // Update UI
+  setLiveAttendanceList(prev => [
+    newRecord,
+    ...prev
+  ]);
+
+  setAllAttendanceRecords(prev => [
+    newRecord,
+    ...prev
+  ]);
+
+
+  setScannedStudentIds(prev => {
+    const updated = new Set(prev);
+    updated.add(cleanedId);
+    return updated;
+  });
+
+
+  // Save Supabase
+  if(supabase){
+    const {error} = await supabase
+      .from('attendance')
+      .insert([{
+        student_id: matchedStudent.studentId,
+        student_name: matchedStudent.name,
+        department: matchedStudent.department,
+        year: matchedStudent.year,
+        subject:newRecord.subject,
+        time_marked:newRecord.timestamp,
+        date_marked:newRecord.date,
+        status:'PRESENT'
+      }]);
+
+    if(error){
+      console.error("Supabase Error:",error);
+    }
+  }
+
+
+  setNotification({
+    type:'success',
+    message:`Attendance marked for ${matchedStudent.name} (${matchedStudent.studentId})!`
+  });
+};
+  const handleManualScanSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!manualInput.trim()) return;
+    handleQRScanSuccess(manualInput.trim());
+    setManualInput('');
+  };
+
+  // --- Session Statistics ---
+  const totalEnrolled = students.length;
+  const totalPresent = liveAttendanceList.length;
+  const totalAbsent = Math.max(0, totalEnrolled - totalPresent);
+  const attendanceRate = totalEnrolled > 0 ? Math.round((totalPresent / totalEnrolled) * 100) : 0;
+
+  const stats: SessionStats = {
+    totalEnrolled,
+    totalPresent,
+    totalAbsent,
+    attendanceRate
+  };
+
+  // Filtered Tables
+  const filteredLiveRecords = liveAttendanceList.filter(
+    (r) =>
+      r.studentName.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      r.studentId.toLowerCase().includes(searchQuery.toLowerCase())
+  );
+
+  const filteredAllRecords = allAttendanceRecords.filter(
+    (r) =>
+      r.studentName.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      r.studentId.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      r.subject.toLowerCase().includes(searchQuery.toLowerCase())
+  );
+
+  const filteredStudents = students.filter(
+    (s) =>
+      s.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      s.studentId.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      s.department.toLowerCase().includes(searchQuery.toLowerCase())
+  );
+
+  return (
+    <div className="min-h-screen bg-gray-50 text-gray-800 p-4 md:p-8">
+      {/* Page Header */}
+      <header className="mb-6 bg-white p-6 rounded-xl shadow-sm border border-gray-200 flex flex-col md:flex-row md:items-center md:justify-between">
+        <div>
+          <h1 className="text-2xl md:text-3xl font-bold text-gray-900 flex items-center gap-3">
+            <QrCode className="w-8 h-8 text-blue-600" />
+            QR Attendance
+          </h1>
+          <p className="text-sm text-gray-500 mt-1">
+            Automated classroom attendance management using QR scanning
+          </p>
+        </div>
+
+        <div className="mt-4 md:mt-0 flex items-center gap-3">
+          <div className={`flex items-center gap-2 px-3.5 py-1.5 rounded-full text-xs font-semibold ${
+            isSessionActive ? 'bg-green-100 text-green-800' : 'bg-gray-100 text-gray-600'
+          }`}>
+            <span className={`w-2.5 h-2.5 rounded-full ${isSessionActive ? 'bg-green-500 animate-pulse' : 'bg-gray-400'}`}></span>
+            {isSessionActive ? `Session Active (${sessionStartTime})` : 'Session Inactive'}
+          </div>
+        </div>
+      </header>
+
+      {/* Primary Module Navigation Tabs */}
+      <nav className="mb-6 flex flex-wrap gap-2 border-b pb-2">
+        <button
+          onClick={() => setActiveTab('live')}
+          className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+            activeTab === 'live' ? 'bg-blue-600 text-white shadow-sm' : 'bg-white text-gray-600 hover:bg-gray-100 border'
+          }`}
+        >
+          <QrCode className="w-4 h-4" />
+          Live QR Attendance
+        </button>
+
+        <button
+          onClick={() => setActiveTab('records')}
+          className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+            activeTab === 'records' ? 'bg-blue-600 text-white shadow-sm' : 'bg-white text-gray-600 hover:bg-gray-100 border'
+          }`}
+        >
+          <Clock className="w-4 h-4" />
+          Attendance Records
+        </button>
+
+        <button
+          onClick={() => setActiveTab('reports')}
+          className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+            activeTab === 'reports' ? 'bg-blue-600 text-white shadow-sm' : 'bg-white text-gray-600 hover:bg-gray-100 border'
+          }`}
+        >
+          <FileText className="w-4 h-4" />
+          Reports
+        </button>
+
+        <button
+          onClick={() => setActiveTab('students')}
+          className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+            activeTab === 'students' ? 'bg-blue-600 text-white shadow-sm' : 'bg-white text-gray-600 hover:bg-gray-100 border'
+          }`}
+        >
+          <Users className="w-4 h-4" />
+          Students & QR Cards
+        </button>
+
+        <button
+          onClick={() => setActiveTab('dashboard')}
+          className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+            activeTab === 'dashboard' ? 'bg-blue-600 text-white shadow-sm' : 'bg-white text-gray-600 hover:bg-gray-100 border'
+          }`}
+        >
+          <LayoutDashboard className="w-4 h-4" />
+          Dashboard
+        </button>
+      </nav>
+
+      {/* Notifications Banner */}
+      {notification && (
+        <div className={`mb-6 p-4 rounded-xl flex items-center justify-between shadow-sm border ${
+          notification.type === 'success' ? 'bg-green-50 text-green-800 border-green-200' :
+          notification.type === 'error' ? 'bg-red-50 text-red-800 border-red-200' :
+          notification.type === 'warning' ? 'bg-amber-50 text-amber-800 border-amber-200' :
+          'bg-blue-50 text-blue-800 border-blue-200'
+        }`}>
+          <div className="flex items-center gap-3">
+            {notification.type === 'success' && <CheckCircle2 className="w-5 h-5 text-green-600" />}
+            {notification.type === 'error' && <XCircle className="w-5 h-5 text-red-600" />}
+            {notification.type === 'warning' && <AlertCircle className="w-5 h-5 text-amber-600" />}
+            {notification.type === 'info' && <Clock className="w-5 h-5 text-blue-600" />}
+            <span className="text-sm font-medium">{notification.message}</span>
+          </div>
+          <button onClick={() => setNotification(null)} className="text-gray-400 hover:text-gray-600 text-sm font-bold">
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      {/* MAIN VIEW: LIVE QR ATTENDANCE */}
+      {activeTab === 'live' && (
+        <div className="space-y-8">
+          
+          {/* Session Configuration Bar */}
+          <section className="bg-white rounded-xl shadow-sm border p-6">
+            <h2 className="text-base font-semibold text-gray-800 mb-4 flex items-center gap-2">
+              <BookOpen className="w-5 h-5 text-blue-600" />
+              Session Setup
+            </h2>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
+              {/* Department */}
+              <div>
+                <label className="block text-xs font-semibold uppercase text-gray-500 mb-2 flex items-center gap-1.5">
+                  <Building className="w-4 h-4 text-gray-400" />
+                  Department
+                </label>
+                <select
+                  value={selectedDepartment}
+                  onChange={(e) => setSelectedDepartment(e.target.value)}
+                  disabled={isSessionActive}
+                  className="w-full bg-gray-50 border border-gray-300 text-gray-900 text-sm rounded-lg p-2.5 disabled:opacity-60"
+                >
+                  {DEPARTMENTS.map((dept) => (
+                    <option key={dept.id} value={dept.id}>{dept.name}</option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Year */}
+              <div>
+                <label className="block text-xs font-semibold uppercase text-gray-500 mb-2 flex items-center gap-1.5">
+                  <GraduationCap className="w-4 h-4 text-gray-400" />
+                  Academic Year
+                </label>
+                <select
+                  value={selectedYear}
+                  onChange={(e) => setSelectedYear(e.target.value)}
+                  disabled={isSessionActive}
+                  className="w-full bg-gray-50 border border-gray-300 text-gray-900 text-sm rounded-lg p-2.5 disabled:opacity-60"
+                >
+                  {YEARS.map((yr) => (
+                    <option key={yr.id} value={yr.id}>{yr.label}</option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Subject */}
+              <div>
+                <label className="block text-xs font-semibold uppercase text-gray-500 mb-2 flex items-center gap-1.5">
+                  <BookOpen className="w-4 h-4 text-gray-400" />
+                  Subject
+                </label>
+                <select
+                  value={selectedSubject}
+                  onChange={(e) => setSelectedSubject(e.target.value)}
+                  disabled={isSessionActive}
+                  className="w-full bg-gray-50 border border-gray-300 text-gray-900 text-sm rounded-lg p-2.5 disabled:opacity-60"
+                >
+                  {SUBJECTS.map((subj) => (
+                    <option key={subj.id} value={subj.id}>{subj.code} - {subj.name}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            {/* Session Action Buttons */}
+            <div className="flex flex-wrap items-center gap-4 pt-2 border-t">
+              {!isSessionActive ? (
+                <button
+                  onClick={handleStartSession}
+                  className="flex items-center gap-2 px-6 py-2.5 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-lg shadow transition-colors"
+                >
+                  <Play className="w-4 h-4 fill-current" />
+                  Start Session
+                </button>
+              ) : (
+                <button
+                  onClick={handleStopSession}
+                  className="flex items-center gap-2 px-6 py-2.5 bg-red-600 hover:bg-red-700 text-white text-sm font-medium rounded-lg shadow transition-colors"
+                >
+                  <Square className="w-4 h-4 fill-current" />
+                  Stop Session
+                </button>
+              )}
+            </div>
+          </section>
+
+          {/* Grid Layout: Scanner + Statistics & Live Table */}
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
+            
+            {/* Left Box: QR Scanner Controls & Camera Feed */}
+            <div className="lg:col-span-5 space-y-6">
+              <div className="bg-white rounded-xl shadow-sm border p-6">
+                <div className="flex items-center justify-between mb-4">
+                  <h3 className="text-md font-semibold text-gray-800 flex items-center gap-2">
+                    <Camera className="w-5 h-5 text-blue-600" />
+                    QR Scanner
+                  </h3>
+                  <span className={`text-xs px-2.5 py-1 rounded-full font-medium ${
+                    isScannerRunning ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-600'
+                  }`}>
+                    {scannerStatus}
+                  </span>
+                </div>
+
+                {/* QR Video Viewport */}
+                <div className="relative bg-gray-900 rounded-xl overflow-hidden min-h-[300px] flex items-center justify-center border border-gray-800">
+                  <div id={scannerContainerId} className="w-full h-full min-h-[280px]"></div>
+
+                  {!isScannerRunning && (
+                    <div className="absolute inset-0 bg-gray-900/90 backdrop-blur-sm flex flex-col items-center justify-center p-6 text-center text-white">
+                      <QrCode className="w-16 h-16 text-gray-500 mb-3" />
+                      <p className="font-semibold text-base text-gray-300">QR Scanner is off</p>
+                      <p className="text-xs text-gray-400 mt-1 max-w-xs">
+                        {isSessionActive 
+                          ? 'Click "Start QR Scanner" below to scan student codes.' 
+                          : 'Start session first, then enable the QR Scanner.'}
+                      </p>
+                    </div>
+                  )}
+                </div>
+
+                {/* Start / Stop Scanner Button */}
+                <div className="mt-4 flex gap-2">
+                  {!isScannerRunning ? (
+                    <button
+                      onClick={startQRScanner}
+                      disabled={!isSessionActive}
+                      className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-green-600 hover:bg-green-700 text-white text-sm font-medium rounded-lg shadow disabled:opacity-50 transition-colors"
+                    >
+                      <Camera className="w-4 h-4" />
+                      Start QR Scanner
+                    </button>
+                  ) : (
+                    <button
+                      onClick={stopQRScanner}
+                      className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-red-600 hover:bg-red-700 text-white text-sm font-medium rounded-lg shadow transition-colors"
+                    >
+                      <Square className="w-4 h-4" />
+                      Stop QR Scanner
+                    </button>
+                  )}
+                </div>
+
+                {/* Manual Student ID Backup Input */}
+                <div className="mt-6 pt-4 border-t">
+                  <label className="block text-xs font-semibold text-gray-600 mb-2">
+                    Manual Student ID Input
+                  </label>
+                  <form onSubmit={handleManualScanSubmit} className="flex gap-2">
+                    <input
+                      type="text"
+                      placeholder="e.g. STU001"
+                      value={manualInput}
+                      onChange={(e) => setManualInput(e.target.value)}
+                      disabled={!isSessionActive}
+                      className="flex-1 bg-white border border-gray-300 text-gray-900 text-sm rounded-lg p-2.5 disabled:opacity-50"
+                    />
+                    <button
+                      type="submit"
+                      disabled={!isSessionActive || !manualInput.trim()}
+                      className="px-4 py-2.5 bg-gray-800 hover:bg-gray-900 text-white text-sm font-medium rounded-lg disabled:opacity-50 transition-colors"
+                    >
+                      Verify & Save
+                    </button>
+                  </form>
+                </div>
+              </div>
+
+              {/* Session Statistics Cards */}
+              <div className="bg-white rounded-xl shadow-sm border p-6">
+                <h3 className="text-md font-semibold text-gray-800 mb-4 flex items-center gap-2">
+                  <BarChart3 className="w-5 h-5 text-blue-600" />
+                  Session Statistics
+                </h3>
+
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="p-4 bg-blue-50 rounded-lg border border-blue-100">
+                    <p className="text-xs font-medium text-blue-600 uppercase">Enrolled</p>
+                    <p className="text-2xl font-bold text-blue-900 mt-1">{stats.totalEnrolled}</p>
+                  </div>
+
+                  <div className="p-4 bg-green-50 rounded-lg border border-green-100">
+                    <p className="text-xs font-medium text-green-600 uppercase">Present</p>
+                    <p className="text-2xl font-bold text-green-900 mt-1">{stats.totalPresent}</p>
+                  </div>
+
+                  <div className="p-4 bg-red-50 rounded-lg border border-red-100">
+                    <p className="text-xs font-medium text-red-600 uppercase">Absent</p>
+                    <p className="text-2xl font-bold text-red-900 mt-1">{stats.totalAbsent}</p>
+                  </div>
+
+                  <div className="p-4 bg-purple-50 rounded-lg border border-purple-100">
+                    <p className="text-xs font-medium text-purple-600 uppercase">Rate</p>
+                    <p className="text-2xl font-bold text-purple-900 mt-1">{stats.attendanceRate}%</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Right Box: Live Attendance Feed Table */}
+            <div className="lg:col-span-7">
+              <div className="bg-white rounded-xl shadow-sm border p-6">
+                <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between border-b pb-4 mb-4 gap-4">
+                  <div>
+                    <h3 className="text-md font-semibold text-gray-800 flex items-center gap-2">
+                      <Clock className="w-5 h-5 text-blue-600" />
+                      Live Attendance Feed
+                    </h3>
+                    <p className="text-xs text-gray-500 mt-0.5">
+                      Scanned records for current active session
+                    </p>
+                  </div>
+
+                  <div className="relative">
+  <Search className="w-4 h-4 text-gray-400 absolute left-3 top-2.5" />
+  <input
+    type="text"
+    placeholder="Search records..."
+    value={searchQuery}
+    onChange={(e) => setSearchQuery(e.target.value)}
+    className="pl-9 pr-4 py-1.5 text-xs bg-gray-50 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500 w-full sm:w-48"
+  />
+</div>  {/* <-- missing close for flex row */}
+
+<div className="overflow-x-auto">
+                  <table className="w-full text-left border-collapse text-sm">
+                    <thead>
+                      <tr className="bg-gray-50 border-b text-gray-500 text-xs uppercase font-semibold">
+                        <th className="py-3 px-4">Student ID</th>
+                        <th className="py-3 px-4">Name</th>
+                        <th className="py-3 px-4">Department</th>
+                        <th className="py-3 px-4">Time Marked</th>
+                        <th className="py-3 px-4">Status</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y">
+                      {filteredLiveRecords.length > 0 ? (
+                        filteredLiveRecords.map((record) => (
+                          <tr key={record.id} className="hover:bg-gray-50 transition-colors">
+                            <td className="py-3 px-4 font-mono text-xs font-bold text-gray-900">{record.studentId}</td>
+                            <td className="py-3 px-4 font-medium text-gray-800">{record.studentName}</td>
+                            <td className="py-3 px-4 text-gray-500 text-xs">{record.department}</td>
+                            <td className="py-3 px-4 text-gray-500 text-xs font-mono">{record.timestamp}</td>
+                            <td className="py-3 px-4">
+                              <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-green-100 text-green-800">
+                                <Check className="w-3 h-3" />
+                                PRESENT
+                              </span>
+                            </td>
+                          </tr>
+                        ))
+                      ) : (
+                        <tr>
+                          <td colSpan={5} className="text-center py-12 text-gray-400">
+                            <Users className="w-10 h-10 mx-auto mb-2 opacity-40" />
+                            <p className="text-sm font-medium">No live QR scans recorded yet</p>
+                            <p className="text-xs mt-1 text-gray-400">
+                              Start session and scan student QR codes to build attendance list.
+                            </p>
+                          </td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+
+          </div>
+        </div>
+      )}
+
+      {/* TAB 2: ATTENDANCE RECORDS */}
+      {activeTab === 'records' && (
+        <div className="bg-white rounded-xl shadow-sm border p-6">
+          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between border-b pb-4 mb-6 gap-4">
+            <div>
+              <h2 className="text-lg font-bold text-gray-800">All Attendance Records</h2>
+              <p className="text-xs text-gray-500">Historical QR code attendance log stored in database</p>
+            </div>
+            <div className="relative">
+              <Search className="w-4 h-4 text-gray-400 absolute left-3 top-2.5" />
+              <input
+                type="text"
+                placeholder="Search records..."
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                className="pl-9 pr-4 py-1.5 text-xs bg-gray-50 border rounded-lg w-full sm:w-56"
+              />
+            </div>
+          </div>
+
+          <div className="overflow-x-auto">
+            <table className="w-full text-left border-collapse text-sm">
+              <thead>
+                <tr className="bg-gray-50 border-b text-gray-500 text-xs uppercase font-semibold">
+                  <th className="py-3 px-4">Date</th>
+                  <th className="py-3 px-4">Student ID</th>
+                  <th className="py-3 px-4">Name</th>
+                  <th className="py-3 px-4">Subject</th>
+                  <th className="py-3 px-4">Department</th>
+                  <th className="py-3 px-4">Time</th>
+                  <th className="py-3 px-4">Status</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y">
+                {filteredAllRecords.length > 0 ? (
+                  filteredAllRecords.map((r) => (
+                    <tr key={r.id} className="hover:bg-gray-50">
+                      <td className="py-3 px-4 text-xs text-gray-500">{r.date}</td>
+                      <td className="py-3 px-4 font-mono text-xs font-bold">{r.studentId}</td>
+                      <td className="py-3 px-4 font-medium">{r.studentName}</td>
+                      <td className="py-3 px-4 text-xs text-gray-600">{r.subject}</td>
+                      <td className="py-3 px-4 text-xs text-gray-500">{r.department}</td>
+                      <td className="py-3 px-4 font-mono text-xs text-gray-500">{r.timestamp}</td>
+                      <td className="py-3 px-4">
+                        <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-green-100 text-green-800">
+                          {r.status}
+                        </span>
+                      </td>
+                    </tr>
+                  ))
+                ) : (
+                  <tr>
+                    <td colSpan={7} className="text-center py-10 text-gray-400">
+                      No attendance records found.
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* TAB 3: REPORTS */}
+      {activeTab === 'reports' && (
+        <div className="bg-white rounded-xl shadow-sm border p-6">
+          <div className="border-b pb-4 mb-6">
+            <h2 className="text-lg font-bold text-gray-800">Attendance Reports & Export</h2>
+            <p className="text-xs text-gray-500">Generate analytics and download attendance sheets</p>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+            <div className="p-5 bg-gray-50 border rounded-xl">
+              <h4 className="text-sm font-semibold text-gray-700">Total Recorded Scans</h4>
+              <p className="text-3xl font-bold text-blue-600 mt-2">{allAttendanceRecords.length}</p>
+            </div>
+            <div className="p-5 bg-gray-50 border rounded-xl">
+              <h4 className="text-sm font-semibold text-gray-700">Total Registered Students</h4>
+              <p className="text-3xl font-bold text-green-600 mt-2">{students.length}</p>
+            </div>
+            <div className="p-5 bg-gray-50 border rounded-xl">
+              <h4 className="text-sm font-semibold text-gray-700">Active Subjects</h4>
+              <p className="text-3xl font-bold text-purple-600 mt-2">{SUBJECTS.length}</p>
+            </div>
+          </div>
+
+          <div className="flex justify-start gap-4">
+            <button 
+              onClick={() => alert('Exporting report to CSV file...')}
+              className="flex items-center gap-2 px-5 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-medium transition-colors"
+            >
+              <Download className="w-4 h-4" />
+              Download CSV Report
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* TAB 4: STUDENTS & STUDENT QR CARD GENERATOR */}
+      {activeTab === 'students' && (
+        <div className="bg-white rounded-xl shadow-sm border p-6">
+          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between border-b pb-4 mb-6 gap-4">
+            <div>
+              <h2 className="text-lg font-bold text-gray-800">Student Directory & QR Cards</h2>
+              <p className="text-xs text-gray-500">Manage student profiles and view student QR cards</p>
+            </div>
+
+            <div className="relative">
+              <Search className="w-4 h-4 text-gray-400 absolute left-3 top-2.5" />
+              <input
+                type="text"
+                placeholder="Search students..."
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                className="pl-9 pr-4 py-1.5 text-xs bg-gray-50 border rounded-lg w-full sm:w-56"
+              />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+            {filteredStudents.map((st) => (
+              <div key={st.id} className="border rounded-xl p-5 hover:shadow-md transition-shadow flex flex-col justify-between bg-gray-50/50">
+                <div className="flex items-start gap-4">
+                  <div className="w-12 h-12 bg-blue-100 rounded-full flex items-center justify-center text-blue-600 font-bold">
+                    <User className="w-6 h-6" />
+                  </div>
+                  <div>
+                    <h3 className="font-semibold text-gray-900">{st.name}</h3>
+                    <p className="text-xs font-mono text-blue-600 font-medium">{st.studentId}</p>
+                    <p className="text-xs text-gray-500 mt-1">{st.department}</p>
+                    <p className="text-xs text-gray-400">{st.year}</p>
+                  </div>
+                </div>
+
+                <div className="mt-4 pt-3 border-t flex justify-end">
+                  <button
+                    onClick={() => setSelectedStudentForQRCard(st)}
+                    className="flex items-center gap-1.5 text-xs font-semibold text-blue-600 hover:text-blue-800"
+                  >
+                    <QrCode className="w-4 h-4" />
+                    View Student QR Card
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* TAB 5: DASHBOARD */}
+      {activeTab === 'dashboard' && (
+        <div className="space-y-6">
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
+            <div className="bg-white p-6 rounded-xl border shadow-sm">
+              <p className="text-xs font-semibold uppercase text-gray-400">Total Enrolled</p>
+              <p className="text-3xl font-bold text-gray-900 mt-2">{students.length}</p>
+            </div>
+            <div className="bg-white p-6 rounded-xl border shadow-sm">
+              <p className="text-xs font-semibold uppercase text-gray-400">Live Present</p>
+              <p className="text-3xl font-bold text-green-600 mt-2">{liveAttendanceList.length}</p>
+            </div>
+            <div className="bg-white p-6 rounded-xl border shadow-sm">
+              <p className="text-xs font-semibold uppercase text-gray-400">Attendance Rate</p>
+              <p className="text-3xl font-bold text-blue-600 mt-2">{attendanceRate}%</p>
+            </div>
+            <div className="bg-white p-6 rounded-xl border shadow-sm">
+              <p className="text-xs font-semibold uppercase text-gray-400">Total Historical Scans</p>
+              <p className="text-3xl font-bold text-purple-600 mt-2">{allAttendanceRecords.length}</p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: STUDENT QR CARD */}
+      {selectedStudentForQRCard && (
+        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-2xl max-w-sm w-full p-6 shadow-2xl border relative">
+            <button
+              onClick={() => setSelectedStudentForQRCard(null)}
+              className="absolute top-4 right-4 text-gray-400 hover:text-gray-600"
+            >
+              <X className="w-5 h-5" />
+            </button>
+
+            <div className="text-center">
+              <div className="inline-block p-2 bg-blue-50 rounded-xl mb-3">
+                <QrCode className="w-8 h-8 text-blue-600" />
+              </div>
+              <h3 className="text-lg font-bold text-gray-900">Student Attendance Pass</h3>
+              <p className="text-xs text-gray-500">Scan this QR code during class sessions</p>
+
+              {/* QR Code Graphic Box */}
+              <div className="my-6 p-4 bg-white border-2 border-dashed border-gray-300 rounded-xl inline-block shadow-inner">
+                <img
+                  src={`https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=${selectedStudentForQRCard.studentId}`}
+                  alt={`QR Code for ${selectedStudentForQRCard.name}`}
+                  className="w-44 h-44 mx-auto"
+                />
+              </div>
+
+              <div className="bg-gray-50 p-4 rounded-xl text-left space-y-1 text-xs">
+                <p><span className="font-semibold text-gray-700">Name:</span> {selectedStudentForQRCard.name}</p>
+                <p><span className="font-semibold text-gray-700">Student ID:</span> {selectedStudentForQRCard.studentId}</p>
+                <p><span className="font-semibold text-gray-700">Department:</span> {selectedStudentForQRCard.department}</p>
+                <p><span className="font-semibold text-gray-700">Year:</span> {selectedStudentForQRCard.year}</p>
+              </div>
+
+              <button
+                onClick={() => window.print()}
+                className="mt-6 w-full flex items-center justify-center gap-2 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-sm font-medium transition-colors"
+              >
+                <Printer className="w-4 h-4" />
+                Print Student QR Card
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+    </div>
+  );
+};
+export const Route = createFileRoute('/_app/attendance/')({
+  component: QRAttendanceModule,
+});
+export default QRAttendanceModule;
