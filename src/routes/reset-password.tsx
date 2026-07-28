@@ -1,5 +1,5 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
-import { useState,useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { ScanFace, Lock, Eye, EyeOff, CheckCircle2 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -7,11 +7,12 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { supabase } from "@/integrations/supabase/client";
 
-
 export const Route = createFileRoute("/reset-password")({
   head: () => ({ meta: [{ title: "Reset Password — QRAttend" }] }),
   component: ResetPassword,
 });
+
+type SessionState = "checking" | "ready" | "invalid";
 
 function ResetPassword() {
   const navigate = useNavigate();
@@ -19,63 +20,68 @@ function ResetPassword() {
   const [confirm, setConfirm] = useState("");
   const [show, setShow] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [sessionReady, setSessionReady] = useState(false);
+  const [sessionState, setSessionState] = useState<SessionState>("checking");
+
+  // Guards against double-exchange (React StrictMode, re-renders, etc.)
+  const exchangeAttempted = useRef(false);
+
   useEffect(() => {
-  const init = async () => {
-    console.log("Current URL:", window.location.href);
+    // Also catch the case where the code already got exchanged
+    // (e.g. by an earlier mount) and Supabase fires the event itself.
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((event, session) => {
+      if (event === "PASSWORD_RECOVERY" && session) {
+        setSessionState("ready");
+      }
+    });
 
-    const code = new URLSearchParams(window.location.search).get("code");
+    const run = async () => {
+      if (exchangeAttempted.current) return;
+      exchangeAttempted.current = true;
 
-    if (code) {
-      const { error } = await supabase.auth.exchangeCodeForSession(code);
+      const params = new URLSearchParams(window.location.search);
+      const code = params.get("code");
 
-      if (error) {
-        console.error("Exchange error:", error);
-        toast.error(error.message);
+      // No code in URL at all: maybe they navigated here directly,
+      // or a session already exists from a prior exchange.
+      if (!code) {
+        const { data } = await supabase.auth.getSession();
+        setSessionState(data.session ? "ready" : "invalid");
         return;
       }
-    }
 
-    const { data } = await supabase.auth.getSession();
+      const { data, error } = await supabase.auth.exchangeCodeForSession(code);
 
-    console.log("SESSION:", data.session);
+      // Strip the code from the URL immediately so a refresh doesn't
+      // try to reuse a (now consumed) one-time code.
+      window.history.replaceState({}, "", window.location.pathname);
 
-    if (data.session) {
-      setSessionReady(true);
-    }
-  };
+      if (error || !data.session) {
+        console.error("exchangeCodeForSession failed:", error);
+        setSessionState("invalid");
+        return;
+      }
 
-  init();
+      setSessionState("ready");
+    };
 
-  const {
-    data: { subscription },
-  } = supabase.auth.onAuthStateChange((event, session) => {
-    console.log("AUTH EVENT:", event, session);
+    run();
 
-    if (
-      (event === "PASSWORD_RECOVERY" || event === "SIGNED_IN") &&
-      session
-    ) {
-      setSessionReady(true);
-    }
-  });
-
-  return () => subscription.unsubscribe();
-}, []);
+    return () => subscription.unsubscribe();
+  }, []);
 
   const onSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-     console.log("onSubmit fired", { pwd, confirm, sessionReady });
     if (pwd.length < 8) return toast.error("Password must be at least 8 characters");
     if (pwd !== confirm) return toast.error("Passwords do not match");
-    if (!sessionReady) {
+    if (sessionState !== "ready") {
       return toast.error("Reset link expired or invalid. Please request a new one.");
     }
 
     setLoading(true);
     try {
       const { error } = await supabase.auth.updateUser({ password: pwd });
-      console.log("Supabase error:", error);
       if (error) {
         toast.error(error.message);
         return;
@@ -84,19 +90,42 @@ function ResetPassword() {
       await supabase.auth.signOut();
       navigate({ to: "/login" });
     } catch (err) {
-      console.error("updateUser threw:", err);
       toast.error(err instanceof Error ? err.message : "Something went wrong. Please try again.");
     } finally {
       setLoading(false);
     }
   };
 
-
   const strength = Math.min(4, Math.floor(pwd.length / 3)) +
     (/[A-Z]/.test(pwd) ? 1 : 0) +
     (/[0-9]/.test(pwd) ? 1 : 0) +
     (/[^A-Za-z0-9]/.test(pwd) ? 1 : 0);
   const strengthLabel = ["", "Weak", "Fair", "Good", "Strong", "Strong"][Math.min(strength, 5)];
+
+  if (sessionState === "checking") {
+    return (
+      <main className="min-h-screen grid place-items-center p-6">
+        <p className="text-sm text-muted-foreground">Verifying reset link…</p>
+      </main>
+    );
+  }
+
+  if (sessionState === "invalid") {
+    return (
+      <main className="min-h-screen grid place-items-center p-6 text-center">
+        <div className="max-w-sm space-y-3">
+          <h2 className="text-xl font-bold">Link expired or already used</h2>
+          <p className="text-sm text-muted-foreground">
+            Password reset links can only be used once and expire quickly.
+            Please request a new one.
+          </p>
+          <Button onClick={() => navigate({ to: "/forgot-password" })}>
+            Request new link
+          </Button>
+        </div>
+      </main>
+    );
+  }
 
   return (
     <main className="min-h-screen grid place-items-center p-6 bg-gradient-to-br from-background via-secondary/30 to-background">
