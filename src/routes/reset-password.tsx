@@ -21,16 +21,31 @@ function ResetPassword() {
   const [loading, setLoading] = useState(false);
   const [sessionReady, setSessionReady] = useState(false);
   useEffect(() => {
-  console.log("Current URL:", window.location.href);
+  const init = async () => {
+    console.log("Current URL:", window.location.href);
 
-  supabase.auth.getSession().then(({ data, error }) => {
+    const code = new URLSearchParams(window.location.search).get("code");
+
+    if (code) {
+      const { error } = await supabase.auth.exchangeCodeForSession(code);
+
+      if (error) {
+        console.error("Exchange error:", error);
+        toast.error(error.message);
+        return;
+      }
+    }
+
+    const { data } = await supabase.auth.getSession();
+
     console.log("SESSION:", data.session);
-    console.log("SESSION ERROR:", error);
 
     if (data.session) {
       setSessionReady(true);
     }
-  });
+  };
+
+  init();
 
   const {
     data: { subscription },
